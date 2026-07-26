@@ -60,10 +60,14 @@ Red::Vector4 WorldSystem::GetPlayerPosition()
     return position;
 }
 
+// Debug helper, so keep the log here rather than in GetPlayerPosition which will
+// end up on the per-frame path. CET buffers its own console log, ours is reliable.
 Red::CString WorldSystem::GetPlayerPositionText()
 {
     const auto position = GetPlayerPosition();
     const auto text = std::format("{:.2f}, {:.2f}, {:.2f}", position.X, position.Y, position.Z);
+
+    CYBERMP_INFO("player position: %s", text.c_str());
 
     return Red::CString(text.c_str());
 }
