@@ -2,6 +2,8 @@
 
 #include <RedLib.hpp>
 
+#include <Version.hpp>
+
 #include "Log.hpp"
 
 const RED4ext::v1::Sdk* Plugin::s_sdk = nullptr;
@@ -18,8 +20,9 @@ void Plugin::OnLoad(RED4ext::v1::PluginHandle aHandle, const RED4ext::v1::Sdk* a
 
     // Game allocators aren't up yet, so keep this cheap. Real init goes in a game state later.
     const auto& runtime = *aSdk->runtime;
-    CYBERMP_INFO("loaded -- game %u.%u.%u", static_cast<unsigned>(runtime.major),
-                 static_cast<unsigned>(runtime.minor), static_cast<unsigned>(runtime.patch));
+    CYBERMP_INFO("loaded -- cybermp %s (%s) -- game %u.%u.%u", CYBERMP_VERSION, CYBERMP_GIT_HASH,
+                 static_cast<unsigned>(runtime.major), static_cast<unsigned>(runtime.minor),
+                 static_cast<unsigned>(runtime.patch));
 }
 
 void Plugin::OnUnload()

@@ -22,6 +22,23 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Only place in the project that knows where the game lives.
 set(CYBERMP_GAME_DIR "" CACHE PATH "Cyberpunk 2077 install root (e.g. D:/Cyberpunk 2077)")
 
+# Logged at load: a stale dll is otherwise indistinguishable from a missing method.
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE CYBERMP_GIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+if(NOT CYBERMP_GIT_HASH)
+    set(CYBERMP_GIT_HASH "unknown")
+endif()
+
+configure_file(cmake/Version.hpp.in "${CMAKE_BINARY_DIR}/generated/Version.hpp" @ONLY)
+
 # Static lib by default, so the sdk compiles once instead of per translation unit.
 add_subdirectory(vendor/RED4ext.SDK)
 

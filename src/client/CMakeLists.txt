@@ -11,6 +11,8 @@ add_library(cybermp SHARED
 
 target_link_libraries(cybermp PRIVATE RED4ext::SDK RedLib)
 
+target_include_directories(cybermp PRIVATE "${CMAKE_BINARY_DIR}/generated")
+
 target_compile_definitions(cybermp PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
