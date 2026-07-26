@@ -91,7 +91,80 @@ void WorldSystem::OnWorldAttached(Red::world::RuntimeScene*)
 void WorldSystem::OnWorldDetached(Red::world::RuntimeScene*)
 {
     m_worldAttached = false;
+
+    // Entities die with the world, so keeping their ids would only leak stale ones.
+    {
+        std::scoped_lock lock(m_spawnedMutex);
+        m_spawned.clear();
+    }
+
     CYBERMP_INFO("world detached");
+}
+
+void WorldSystem::TrackSpawned(Red::EntityID aEntityID)
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return;
+    }
+
+    std::scoped_lock lock(self->m_spawnedMutex);
+    self->m_spawned.push_back(aEntityID);
+}
+
+uint32_t WorldSystem::GetSpawnedCount()
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return 0;
+    }
+
+    std::scoped_lock lock(self->m_spawnedMutex);
+    return static_cast<uint32_t>(self->m_spawned.size());
+}
+
+uint32_t WorldSystem::DespawnAll()
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return 0;
+    }
+
+    std::vector<Red::EntityID> pending;
+    {
+        std::scoped_lock lock(self->m_spawnedMutex);
+        pending.swap(self->m_spawned);
+    }
+
+    Red::Handle<Red::IScriptable> system;
+    if (!Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", system) || !system)
+    {
+        CYBERMP_ERROR("GetDynamicEntitySystem failed, %zu ids dropped", pending.size());
+        return 0;
+    }
+
+    // Signature from Codeware's own declaration in Codeware.Global.reds:
+    //   public native func DeleteEntity(id: EntityID) -> Bool
+    uint32_t removed = 0;
+    for (const auto& entityID : pending)
+    {
+        bool deleted = false;
+        if (Red::CallVirtual(system.instance, "DeleteEntity", deleted, entityID) && deleted)
+        {
+            ++removed;
+        }
+        else
+        {
+            CYBERMP_ERROR("DeleteEntity failed for id %llu", entityID.hash);
+        }
+    }
+
+    CYBERMP_INFO("despawned %u of %zu", removed, pending.size());
+
+    return removed;
 }
 
 bool WorldSystem::IsWorldReady()
@@ -156,6 +229,7 @@ Red::CString WorldSystem::SpawnProp()
     }
 
     // Spawning is async: a valid id here only means the request was accepted.
+    TrackSpawned(entityID);
     CYBERMP_INFO("prop spawn requested, id %llu", entityID.hash);
 
     return Red::CString(std::format("spawn requested, id {}", entityID.hash).c_str());
@@ -190,6 +264,7 @@ Red::CString WorldSystem::SpawnNpc(const Red::CString& aRecord)
         return Red::CString(std::format("spawn refused, unknown record '{}'?", record).c_str());
     }
 
+    TrackSpawned(entityID);
     CYBERMP_INFO("npc spawn requested, record '%s', id %llu", record, entityID.hash);
 
     return Red::CString(std::format("spawn requested, record {}, id {}", record, entityID.hash).c_str());
@@ -201,4 +276,6 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(GetPlayerPositionText);
     RTTI_METHOD(SpawnProp);
     RTTI_METHOD(SpawnNpc);
+    RTTI_METHOD(GetSpawnedCount);
+    RTTI_METHOD(DespawnAll);
 });
