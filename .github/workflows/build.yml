@@ -39,9 +39,10 @@ jobs:
           $dumpbin = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
                      Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin not found" }
-          $exports = & $dumpbin.FullName /EXPORTS 'build/src/client/Release/cybermp.dll'
+          # Join first: -match/-like against an array filters instead of returning a bool.
+          $exports = (& $dumpbin.FullName /EXPORTS 'build/src/client/Release/cybermp.dll') -join "`n"
           foreach ($name in 'Supports', 'Query', 'Main') {
-            if ($exports -notmatch "\b$name = $name\b") { throw "missing undecorated export: $name" }
+            if ($exports -notlike "*$name = $name*") { throw "missing undecorated export: $name" }
           }
           Write-Host "ok - Supports / Query / Main"
 
