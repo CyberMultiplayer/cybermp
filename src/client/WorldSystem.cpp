@@ -10,6 +10,8 @@
 #include <RED4ext/Scripting/Natives/Generated/red/ResourceReferenceScriptToken.hpp>
 
 #include "Log.hpp"
+#include "NetClient.hpp"
+#include "Plugin.hpp"
 
 namespace
 {
@@ -328,7 +330,7 @@ void WorldSystem::RunTick(Red::FrameInfo& aFrame, std::atomic_uint64_t& aCounter
     m_drainThreadId.store(thisThread, std::memory_order_relaxed);
 
     // Bounded on purpose: a burst off the network must not be allowed to stall a frame.
-    const auto ran = m_tasks.Drain(64);
+    const auto ran = Plugin::Tasks().Drain(64);
     if (ran > 0)
     {
         m_tasksRun.fetch_add(ran, std::memory_order_relaxed);
@@ -356,7 +358,7 @@ Red::CString WorldSystem::GetTickStats()
         "frameBegin={} mpUpdate={} tasksRun={} pending={} dt={:.4f} maxTick={}us "
         "tickThreadChanges={} producerThread={} tasksAlwaysOnDrainThread={}",
         self->m_frameBeginTicks.load(), self->m_multiplayerTicks.load(), self->m_tasksRun.load(),
-        self->m_tasks.Pending(), self->m_lastDeltaTime.load(), self->m_maxTickMicros.load(),
+        Plugin::Tasks().Pending(), self->m_lastDeltaTime.load(), self->m_maxTickMicros.load(),
         self->m_tickThreadChanges.load(), self->m_producerThreadId.load(),
         self->m_taskRanOffDrainThread.load() ? "no" : "yes");
 
@@ -386,7 +388,7 @@ Red::CString WorldSystem::PostTasksFromThread(int32_t aCount)
         {
             // The invariant that matters: a task body must run on the thread that is
             // draining it, never on the one that queued it.
-            self->m_tasks.Push([self] {
+            Plugin::Tasks().Push([self] {
                 if (CurrentThreadId() != self->m_drainThreadId.load(std::memory_order_relaxed))
                 {
                     self->m_taskRanOffDrainThread.store(true, std::memory_order_relaxed);
@@ -396,6 +398,44 @@ Red::CString WorldSystem::PostTasksFromThread(int32_t aCount)
     });
 
     return Red::CString(std::format("queued {} task(s) from a worker thread", aCount).c_str());
+}
+
+Red::CString WorldSystem::Connect(uint32_t aPort, const Red::CString& aUsername)
+{
+    if (aPort == 0 || aPort > 65535)
+    {
+        return "port must be 1..65535";
+    }
+
+    const std::string username = aUsername.Length() > 0 ? aUsername.c_str() : "player";
+
+    if (!Plugin::Net().Connect("127.0.0.1", static_cast<uint16_t>(aPort), username))
+    {
+        return Red::CString(std::format("connect failed: {}", Plugin::Net().GetStats().lastError).c_str());
+    }
+
+    return Red::CString(std::format("connecting to 127.0.0.1:{} as '{}'", aPort, username).c_str());
+}
+
+Red::CString WorldSystem::Disconnect()
+{
+    Plugin::Net().Disconnect();
+
+    return "disconnected";
+}
+
+Red::CString WorldSystem::GetNetStats()
+{
+    const auto stats = Plugin::Net().GetStats();
+
+    const auto text = std::format("state={} sent={} received={} malformed={} helloAttempts={} rtt={:.3f}ms "
+                                  "appliedOnGameThread={} error='{}'",
+                                  client::ToString(stats.state), stats.sent, stats.received, stats.malformed,
+                                  stats.helloAttempts, stats.lastRttMs, stats.appliedOnGameThread, stats.lastError);
+
+    CYBERMP_INFO("%s", text.c_str());
+
+    return Red::CString(text.c_str());
 }
 
 RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
@@ -408,4 +448,7 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(DespawnAll);
     RTTI_METHOD(GetTickStats);
     RTTI_METHOD(PostTasksFromThread);
+    RTTI_METHOD(Connect);
+    RTTI_METHOD(Disconnect);
+    RTTI_METHOD(GetNetStats);
 });

@@ -37,9 +37,13 @@ public:
 
     static Red::CString GetTickStats();
 
-    // Debug: pushes tasks from a worker thread to prove the bridge the network will
-    // use. Nothing else in the plugin may touch the game off the game thread.
+    // Debug: pushes tasks from a worker thread to prove the bridge the network uses.
+    // Nothing else in the plugin may touch the game off the game thread.
     static Red::CString PostTasksFromThread(int32_t aCount);
+
+    static Red::CString Connect(uint32_t aPort, const Red::CString& aUsername);
+    static Red::CString Disconnect();
+    static Red::CString GetNetStats();
 
 private:
     void OnWorldAttached(Red::world::RuntimeScene* aScene) override;
@@ -70,7 +74,6 @@ private:
     std::atomic_uint64_t m_tickThreadChanges{};
     std::atomic_bool m_taskRanOffDrainThread{};
 
-    core::TaskQueue m_tasks;
     std::jthread m_producer; // joins on destruction, so no detached thread outlives us
 
     bool m_worldAttached{};

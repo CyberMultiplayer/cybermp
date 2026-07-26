@@ -7,6 +7,8 @@ add_library(cybermp SHARED
     DebugApi.hpp
     WorldSystem.cpp
     WorldSystem.hpp
+    NetClient.cpp
+    NetClient.hpp
 )
 
 target_link_libraries(cybermp PRIVATE RED4ext::SDK RedLib cybermp_common)

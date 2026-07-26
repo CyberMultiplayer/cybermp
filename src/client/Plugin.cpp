@@ -5,9 +5,24 @@
 #include <Version.hpp>
 
 #include "Log.hpp"
+#include "NetClient.hpp"
 
 const RED4ext::v1::Sdk* Plugin::s_sdk = nullptr;
 RED4ext::v1::PluginHandle Plugin::s_handle = {};
+
+// Function-local statics: built on first use, which keeps them out of Main(Load)
+// where the game's allocators are not up yet.
+core::TaskQueue& Plugin::Tasks()
+{
+    static core::TaskQueue s_tasks;
+    return s_tasks;
+}
+
+client::NetClient& Plugin::Net()
+{
+    static client::NetClient s_net(Tasks());
+    return s_net;
+}
 
 void Plugin::OnLoad(RED4ext::v1::PluginHandle aHandle, const RED4ext::v1::Sdk* aSdk)
 {
@@ -27,6 +42,11 @@ void Plugin::OnLoad(RED4ext::v1::PluginHandle aHandle, const RED4ext::v1::Sdk* a
 
 void Plugin::OnUnload()
 {
+    // Joins the network thread before the sdk pointer goes away, otherwise it could
+    // still try to log through it.
+    Net().Disconnect();
+    Tasks().Clear();
+
     CYBERMP_INFO("unloaded");
 
     s_sdk = nullptr;
