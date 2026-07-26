@@ -216,6 +216,11 @@ script::ILogger& ScriptHost::Logger()
     return *m_logger;
 }
 
+const std::vector<std::string>& ScriptHost::LogLines() const
+{
+    return m_logger->Lines();
+}
+
 namespace
 {
 class LogBackend final : public script::IBackend

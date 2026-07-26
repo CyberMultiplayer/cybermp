@@ -41,6 +41,7 @@ public:
 
     // Test seam: lets a test observe what scripts logged.
     script::ILogger& Logger();
+    const std::vector<std::string>& LogLines() const;
 
     size_t BackendCount() const
     {

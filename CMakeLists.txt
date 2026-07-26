@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(cybermp
     VERSION 0.1.0
     DESCRIPTION "Multiplayer foundation for Cyberpunk 2077"
-    LANGUAGES CXX
+    LANGUAGES C CXX # C for the vendored Lua
 )
 
 # Fail early with a clear message instead of shipping a dll the game won't load.
@@ -52,6 +52,8 @@ foreach(dep RED4ext.SDK RedLib)
         set_target_properties(${dep} PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${dep_includes}")
     endif()
 endforeach()
+
+include(cmake/Lua.cmake)
 
 enable_testing()
 

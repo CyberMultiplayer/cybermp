@@ -4,3 +4,9 @@
 [submodule "vendor/RedLib"]
 	path = vendor/RedLib
 	url = https://github.com/psiberx/cp2077-red-lib.git
+[submodule "vendor/lua"]
+	path = vendor/lua
+	url = https://github.com/lua/lua.git
+[submodule "vendor/sol2"]
+	path = vendor/sol2
+	url = https://github.com/ThePhD/sol2.git

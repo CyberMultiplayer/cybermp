@@ -1,11 +1,17 @@
 // Hand-rolled harness on purpose: ten-odd assertions don't justify pulling in a
 // framework. Swap for doctest/catch2 the day this outgrows it.
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
+#include "LuaBackend.hpp"
 #include "Net.hpp"
 #include "Protocol.hpp"
 #include "Serialize.hpp"
@@ -657,6 +663,170 @@ void TestScriptUnknownPlayer()
     CHECK(spyPtr->lastUsername.empty());
 }
 
+// Writes real .lua files, but stays in-process: no spawn, no sleep.
+std::filesystem::path MakeScriptDir(const char* aName,
+                                   const std::vector<std::pair<const char*, const char*>>& aFiles)
+{
+    const auto dir = std::filesystem::temp_directory_path() / "cybermp_tests" / aName;
+
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(dir, error);
+
+    for (const auto& [name, body] : aFiles)
+    {
+        std::ofstream out(dir / name);
+        out << body;
+    }
+
+    return dir;
+}
+
+bool AnyLineContains(const std::vector<std::string>& aLines, std::string_view aNeedle)
+{
+    return std::any_of(aLines.begin(), aLines.end(),
+                       [&](const std::string& aLine) { return aLine.find(aNeedle) != std::string::npos; });
+}
+
+void TestLuaDispatch()
+{
+    std::printf("lua: a script receives events with usable player data\n");
+
+    const auto dir = MakeScriptDir("dispatch", {{"a.lua", R"(
+        cybermp.on("playerJoin", function(id)
+            local p = cybermp.players.find(id)
+            cybermp.log("saw " .. p.name .. " at " .. p.address .. " n=" .. cybermp.players.count())
+        end)
+        cybermp.on("playerLeave", function(id) cybermp.log("gone " .. id) end)
+    )"}});
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+    host.Add(server::MakeLuaBackend(dir));
+
+    CHECK(host.StartAll() == 1);
+
+    server::PlayerId id = server::kInvalidPlayer;
+    CHECK(sessions.Join(Peer(4242), "luaguy", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    host.OnPlayerJoin(id);
+    CHECK(AnyLineContains(host.LogLines(), "saw luaguy at 127.0.0.1:4242 n=1"));
+
+    host.OnPlayerLeave(id);
+    CHECK(AnyLineContains(host.LogLines(), "gone 1"));
+}
+
+void TestLuaBrokenScriptIsIsolated()
+{
+    std::printf("lua: a broken script does not stop the others\n");
+
+    const auto dir = MakeScriptDir("broken", {
+        {"01_bad.lua", "this is not lua ((("},
+        {"02_good.lua", R"(cybermp.on("playerJoin", function(id) cybermp.log("good ran") end))"},
+    });
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+    host.Add(server::MakeLuaBackend(dir));
+
+    // Starting still succeeds: one bad file is not a reason to refuse to serve.
+    CHECK(host.StartAll() == 1);
+    CHECK(AnyLineContains(host.LogLines(), "syntax error"));
+    CHECK(AnyLineContains(host.LogLines(), "1 of 2 script(s) loaded"));
+
+    server::PlayerId id = server::kInvalidPlayer;
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    host.OnPlayerJoin(id);
+    CHECK(AnyLineContains(host.LogLines(), "good ran"));
+}
+
+void TestLuaThrowingHandlerIsContained()
+{
+    std::printf("lua: a handler that errors does not stop the next one\n");
+
+    const auto dir = MakeScriptDir("throwing", {
+        {"01_throws.lua", R"(cybermp.on("playerJoin", function(id) error("boom") end))"},
+        {"02_after.lua", R"(cybermp.on("playerJoin", function(id) cybermp.log("after ran") end))"},
+    });
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+    host.Add(server::MakeLuaBackend(dir));
+    CHECK(host.StartAll() == 1);
+
+    server::PlayerId id = server::kInvalidPlayer;
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    host.OnPlayerJoin(id);
+
+    CHECK(AnyLineContains(host.LogLines(), "boom"));
+    CHECK(AnyLineContains(host.LogLines(), "after ran")); // the point of the test
+}
+
+void TestLuaBadApiUseIsReadable()
+{
+    std::printf("lua: misusing the api gives a message a script author can read\n");
+
+    const auto dir = MakeScriptDir("badapi", {{"a.lua", R"(cybermp.on("playerJoin", 42))"}});
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+    host.Add(server::MakeLuaBackend(dir));
+    CHECK(host.StartAll() == 1);
+
+    CHECK(AnyLineContains(host.LogLines(), "must be a function, got number"));
+
+    // And no c++ template names leaking into a scripter's console.
+    CHECK(!AnyLineContains(host.LogLines(), "sol::"));
+}
+
+void TestLuaKickReachesTheCore()
+{
+    std::printf("lua: a script can kick, and it arrives as a queued request\n");
+
+    const auto dir = MakeScriptDir("kick", {{"a.lua", R"(
+        cybermp.on("playerJoin", function(id)
+            local p = cybermp.players.find(id)
+            if p.name == "banned" then p.kick("nope") end
+        end)
+    )"}});
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+    host.Add(server::MakeLuaBackend(dir));
+    CHECK(host.StartAll() == 1);
+
+    server::PlayerId keep = server::kInvalidPlayer;
+    server::PlayerId banned = server::kInvalidPlayer;
+    CHECK(sessions.Join(Peer(1), "welcome", proto::kVersion, 0, keep) == server::JoinResult::Accepted);
+    CHECK(sessions.Join(Peer(2), "banned", proto::kVersion, 0, banned) == server::JoinResult::Accepted);
+
+    host.OnPlayerJoin(keep);
+    CHECK(host.TakeKicks().empty());
+
+    host.OnPlayerJoin(banned);
+    const auto kicks = host.TakeKicks();
+    CHECK(kicks.size() == 1);
+    CHECK(!kicks.empty() && kicks[0].playerId == banned);
+    CHECK(!kicks.empty() && kicks[0].reason == "nope");
+
+    // Queued only: the core still decides when to act.
+    CHECK(sessions.Count() == 2);
+}
+
+void TestLuaMissingDirectoryIsFine()
+{
+    std::printf("lua: no script directory is not an error\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+    host.Add(server::MakeLuaBackend("definitely/not/here"));
+
+    // A server with no scripts is a valid server.
+    CHECK(host.StartAll() == 1);
+}
+
 void TestSessionRemove()
 {
     std::printf("sessions: explicit removal\n");
@@ -701,6 +871,12 @@ int main()
     TestScriptKickIsQueued();
     TestScriptFailedStartIsDropped();
     TestScriptUnknownPlayer();
+    TestLuaDispatch();
+    TestLuaBrokenScriptIsIsolated();
+    TestLuaThrowingHandlerIsContained();
+    TestLuaBadApiUseIsReadable();
+    TestLuaKickReachesTheCore();
+    TestLuaMissingDirectoryIsFine();
 
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
 

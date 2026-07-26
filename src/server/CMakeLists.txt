@@ -5,10 +5,15 @@ add_library(cybermp_serverlib STATIC
     Script.hpp
     ScriptHost.cpp
     ScriptHost.hpp
+    LuaBackend.cpp
+    LuaBackend.hpp
 )
 
 target_include_directories(cybermp_serverlib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(cybermp_serverlib PUBLIC cybermp_common)
+
+# sol2 is PRIVATE: it is an implementation detail of the lua backend and must not
+# leak into anything that links the server lib.
+target_link_libraries(cybermp_serverlib PUBLIC cybermp_common PRIVATE sol2)
 
 add_executable(cybermp_server
     main.cpp

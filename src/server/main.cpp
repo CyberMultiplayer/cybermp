@@ -11,6 +11,7 @@
 
 #include <Version.hpp>
 
+#include "LuaBackend.hpp"
 #include "Net.hpp"
 #include "Protocol.hpp"
 #include "ScriptHost.hpp"
@@ -113,6 +114,7 @@ void HandlePing(net::UdpSocket& aSocket, server::SessionManager& aSessions, cons
 int main(int argc, char** argv)
 {
     const auto port = argc > 1 ? static_cast<uint16_t>(std::atoi(argv[1])) : kDefaultPort;
+    const std::string scriptDir = argc > 2 ? argv[2] : "scripts";
 
     // Redirected stdout is fully buffered on msvc, which loses every log line if the
     // process is killed. A server has to log as it goes.
@@ -142,8 +144,8 @@ int main(int argc, char** argv)
     server::SessionManager sessions(kMaxPlayers, kTimeoutMs);
 
     server::ScriptHost scripts(sessions);
-    scripts.Add(server::MakeLogBackend());
-    std::printf("%zu scripting backend(s) started\n", scripts.StartAll());
+    scripts.Add(server::MakeLuaBackend(scriptDir));
+    std::printf("%zu scripting backend(s) started, scripts from '%s'\n", scripts.StartAll(), scriptDir.c_str());
 
     std::vector<uint8_t> buffer(proto::kMaxDatagram);
     uint64_t rejected = 0;
