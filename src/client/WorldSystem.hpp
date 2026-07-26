@@ -14,6 +14,9 @@ public:
     static Red::Vector4 GetPlayerPosition();
     static Red::CString GetPlayerPositionText();
 
+    // Spawns a prop on the player. Needs Codeware -- the game has no generic spawn api.
+    static Red::CString SpawnProp();
+
 private:
     void OnWorldAttached(Red::world::RuntimeScene* aScene) override;
     void OnWorldDetached(Red::world::RuntimeScene* aScene) override;

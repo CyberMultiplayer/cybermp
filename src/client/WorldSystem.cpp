@@ -5,6 +5,7 @@
 // RedLib.hpp only pulls a handful of generated headers, these aren't among them.
 #include <RED4ext/Scripting/Natives/Generated/game/Object.hpp>
 #include <RED4ext/Scripting/Natives/Generated/game/PlayerSystem.hpp>
+#include <RED4ext/Scripting/Natives/Generated/red/ResourceReferenceScriptToken.hpp>
 
 #include "Log.hpp"
 
@@ -72,8 +73,61 @@ Red::CString WorldSystem::GetPlayerPositionText()
     return Red::CString(text.c_str());
 }
 
+// Ported from the lua validated in the CET console, so the rtti names below are known good.
+// Every step logs: a silent failure here would be untraceable otherwise.
+Red::CString WorldSystem::SpawnProp()
+{
+    constexpr auto kTemplate = "base\\gameplay\\devices\\ladder\\appearances\\10m_gen_default.ent";
+
+    auto spec = Red::MakeScriptedHandle<Red::IScriptable>("DynamicEntitySpec");
+    if (!spec)
+    {
+        CYBERMP_ERROR("DynamicEntitySpec not found -- is Codeware installed?");
+        return "no DynamicEntitySpec";
+    }
+
+    auto* templatePath = Red::GetPropertyPtr<Red::ResRef>(spec.instance, "templatePath");
+    auto* position = Red::GetPropertyPtr<Red::Vector4>(spec.instance, "position");
+    auto* persistState = Red::GetPropertyPtr<bool>(spec.instance, "persistState");
+    auto* persistSpawn = Red::GetPropertyPtr<bool>(spec.instance, "persistSpawn");
+
+    if (!templatePath || !position || !persistState || !persistSpawn)
+    {
+        CYBERMP_ERROR("DynamicEntitySpec layout changed");
+        return "bad spec layout";
+    }
+
+    templatePath->resource = Red::ResourcePath(kTemplate);
+    *position = GetPlayerPosition();
+
+    // The server owns what we spawn, never the save file.
+    *persistState = false;
+    *persistSpawn = false;
+
+    Red::Handle<Red::IScriptable> system;
+    if (!Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", system) || !system)
+    {
+        CYBERMP_ERROR("GetDynamicEntitySystem failed");
+        return "no DynamicEntitySystem";
+    }
+
+    Red::EntityID entityID;
+    if (!Red::CallVirtual(system.instance, "CreateEntity", entityID, spec))
+    {
+        CYBERMP_ERROR("CreateEntity call failed");
+        return "CreateEntity failed";
+    }
+
+    // Spawning is async: a valid id here only means the request was accepted.
+    CYBERMP_INFO("spawn requested, id %llu at %.2f, %.2f, %.2f", entityID.hash, position->X, position->Y,
+                 position->Z);
+
+    return Red::CString(std::format("spawn requested, id {}", entityID.hash).c_str());
+}
+
 RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(IsWorldReady);
     RTTI_METHOD(GetPlayerPosition);
     RTTI_METHOD(GetPlayerPositionText);
+    RTTI_METHOD(SpawnProp);
 });
