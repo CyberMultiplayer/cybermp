@@ -53,6 +53,9 @@ foreach(dep RED4ext.SDK RedLib)
     endif()
 endforeach()
 
+add_subdirectory(src/common)
 add_subdirectory(src/client)
+add_subdirectory(src/server)
+add_subdirectory(src/nettest)
 
 include(cmake/Deploy.cmake)
