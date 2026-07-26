@@ -14,6 +14,7 @@
 #include <RED4ext/Scripting/Natives/Generated/game/PlayerSystem.hpp>
 #include <RED4ext/Scripting/Natives/Generated/red/ResourceReferenceScriptToken.hpp>
 #include <RED4ext/Scripting/Natives/WorldPosition.hpp>
+#include <RED4ext/Scripting/Natives/moveComponent.hpp>
 
 #include "Log.hpp"
 #include "NetClient.hpp"
@@ -305,19 +306,86 @@ Red::Quaternion YawToQuaternion(float aDegrees)
     return quaternion;
 }
 
-bool MoveEntity(const Red::Handle<Red::Entity>& aEntity, const client::RemoteSnapshot& aSnapshot)
+bool WriteTransform(const Red::Handle<Red::Entity>& aEntity, const client::RemoteSnapshot& aSnapshot)
 {
-    if (!aEntity)
-    {
-        return false;
-    }
-
     Red::WorldTransform transform;
     transform.Position = Red::WorldPosition(Red::Vector4(aSnapshot.x, aSnapshot.y, aSnapshot.z, 1.0f));
     transform.Orientation = YawToQuaternion(aSnapshot.rotation);
 
     // Codeware adds SetWorldTransform to Entity; the base game does not expose it.
     return Red::CallVirtual(aEntity.instance, "SetWorldTransform", transform);
+}
+
+// An npc carries moveComponent, moveMotionPlannerComponent and movePoliciesComponent
+// (confirmed by dumping a spawned body's 143 components). The motion planner owns the
+// position, which is why writing only the entity transform is not honoured until the
+// game wakes the npc up.
+bool WriteMover(const Red::Handle<Red::Entity>& aEntity, const client::RemoteSnapshot& aSnapshot,
+                const Red::Vector3& aVelocity)
+{
+    Red::Handle<Red::IComponent> component;
+    if (!Red::CallVirtual(aEntity.instance, "FindComponentByType", component, Red::CName("moveComponent")) ||
+        !component)
+    {
+        return false;
+    }
+
+    // Raw field writes. The sdk asserts these offsets, so a layout change after a
+    // game patch breaks the build rather than corrupting memory silently.
+    auto* mover = reinterpret_cast<Red::moveComponent*>(component.instance);
+
+    const Red::Vector4 position(aSnapshot.x, aSnapshot.y, aSnapshot.z, 1.0f);
+    mover->position = position;
+    mover->worldTransform.Position = Red::WorldPosition(position);
+    mover->worldTransform.Orientation = YawToQuaternion(aSnapshot.rotation);
+
+    // The animation system reads speed to pick idle, walk or run. Without it a moving
+    // body would slide along the ground.
+    mover->speed = aVelocity;
+
+    return true;
+}
+
+// The game's own way of relocating something. Goes through the systems that a raw
+// field write bypasses, which is exactly what an ai driven npc keeps undoing.
+bool WriteTeleport(const Red::Handle<Red::Entity>& aEntity, const client::RemoteSnapshot& aSnapshot)
+{
+    Red::Handle<Red::IScriptable> facility;
+    if (!Red::CallStatic("ScriptGameInstance", "GetTeleportationFacility", facility) || !facility)
+    {
+        return false;
+    }
+
+    const Red::Vector4 position(aSnapshot.x, aSnapshot.y, aSnapshot.z, 1.0f);
+
+    Red::EulerAngles rotation;
+    rotation.Roll = 0.0f;
+    rotation.Pitch = 0.0f;
+    rotation.Yaw = aSnapshot.rotation;
+
+    return Red::CallVirtual(facility.instance, "Teleport", aEntity, position, rotation);
+}
+} // namespace
+
+namespace
+{
+// Remote bodies are not in the m_spawned registry: they have their own lifetime,
+// tied to a player rather than to a console command.
+bool DestroyBodyEntity(Red::EntityID aEntityId)
+{
+    if (!aEntityId.IsDefined())
+    {
+        return false;
+    }
+
+    Red::Handle<Red::IScriptable> system;
+    if (!Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", system) || !system)
+    {
+        return false;
+    }
+
+    bool deleted = false;
+    return Red::CallVirtual(system.instance, "DeleteEntity", deleted, aEntityId) && deleted;
 }
 } // namespace
 
@@ -334,16 +402,7 @@ void WorldSystem::PumpRemotePlayers()
         }
         else if (const auto it = m_bodies.find(event.playerId); it != m_bodies.end())
         {
-            if (it->second.entityId.IsDefined())
-            {
-                Red::Handle<Red::IScriptable> system;
-                if (Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", system) && system)
-                {
-                    bool deleted = false;
-                    Red::CallVirtual(system.instance, "DeleteEntity", deleted, it->second.entityId);
-                }
-            }
-
+            DestroyBodyEntity(it->second.entityId);
             m_bodies.erase(it);
         }
     }
@@ -381,17 +440,38 @@ void WorldSystem::PumpRemotePlayers()
                 continue;
             }
 
-            auto* recordID = Red::GetPropertyPtr<Red::TweakDBID>(spec.instance, "recordID");
             auto* position = Red::GetPropertyPtr<Red::Vector4>(spec.instance, "position");
             auto* persistState = Red::GetPropertyPtr<bool>(spec.instance, "persistState");
             auto* persistSpawn = Red::GetPropertyPtr<bool>(spec.instance, "persistSpawn");
 
-            if (!recordID || !position || !persistState || !persistSpawn)
+            if (!position || !persistState || !persistSpawn)
             {
                 continue;
             }
 
-            *recordID = Red::TweakDBID("Character.spr_animals_bouncer1_ranged1_omaha_mb");
+            if (m_bodyKind.load(std::memory_order_relaxed) == 1)
+            {
+                // A prop carries no ai, so nothing overwrites what we write.
+                auto* templatePath = Red::GetPropertyPtr<Red::ResRef>(spec.instance, "templatePath");
+                if (!templatePath)
+                {
+                    continue;
+                }
+
+                templatePath->resource =
+                    Red::ResourcePath("base\\gameplay\\devices\\ladder\\appearances\\10m_gen_default.ent");
+            }
+            else
+            {
+                auto* recordID = Red::GetPropertyPtr<Red::TweakDBID>(spec.instance, "recordID");
+                if (!recordID)
+                {
+                    continue;
+                }
+
+                *recordID = Red::TweakDBID("Character.spr_animals_bouncer1_ranged1_omaha_mb");
+            }
+
             *position = Red::Vector4(snapshot.x, snapshot.y, snapshot.z, 1.0f);
             *persistState = false;
             *persistSpawn = false;
@@ -417,7 +497,63 @@ void WorldSystem::PumpRemotePlayers()
             continue; // still spawning
         }
 
-        MoveEntity(entity, snapshot);
+        // Velocity from the previous snapshot rather than from the frame: snapshots
+        // arrive at 15 Hz and the frame runs at 60, so per-frame deltas would be zero
+        // most of the time.
+        Red::Vector3 velocity{};
+        if (body.hasPrevious && snapshot.tick > body.previousTick)
+        {
+            const auto elapsed = static_cast<float>(snapshot.tick - body.previousTick) * 0.066f;
+            if (elapsed > 0.0f)
+            {
+                velocity.X = (snapshot.x - body.previousX) / elapsed;
+                velocity.Y = (snapshot.y - body.previousY) / elapsed;
+                velocity.Z = (snapshot.z - body.previousZ) / elapsed;
+            }
+        }
+
+        if (!body.hasPrevious || snapshot.tick != body.previousTick)
+        {
+            body.hasPrevious = true;
+            body.previousTick = snapshot.tick;
+            body.previousX = snapshot.x;
+            body.previousY = snapshot.y;
+            body.previousZ = snapshot.z;
+        }
+
+        const auto mode = m_moveMode.load(std::memory_order_relaxed);
+
+        if (mode == 0 || mode == 2)
+        {
+            if (WriteTransform(entity, snapshot))
+            {
+                m_transformWrites.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        if (mode == 1 || mode == 2)
+        {
+            if (WriteMover(entity, snapshot, velocity))
+            {
+                m_moverWrites.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+            {
+                m_moverMissing.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        if (mode == 3)
+        {
+            if (WriteTeleport(entity, snapshot))
+            {
+                m_transformWrites.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+            {
+                m_moverMissing.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -628,13 +764,135 @@ Red::CString WorldSystem::GetRemoteStats()
         }
     }
 
-    const auto text = std::format("bodies={} spawned={} snapshots={} statesSent={} outOfOrder={} tracked={}",
+    const auto text = std::format("bodies={} spawned={} snapshots={} statesSent={} outOfOrder={} tracked={} "
+                                  "moveMode={} moverWrites={} transformWrites={} moverMissing={}",
                                   self->m_bodies.size(), spawned, stats.statesReceived, stats.statesSent,
-                                  stats.statesOutOfOrder, stats.remoteCount);
+                                  stats.statesOutOfOrder, stats.remoteCount, self->m_moveMode.load(),
+                                  self->m_moverWrites.load(), self->m_transformWrites.load(),
+                                  self->m_moverMissing.load());
 
     CYBERMP_INFO("%s", text.c_str());
 
     return Red::CString(text.c_str());
+}
+
+Red::CString WorldSystem::DumpRemoteComponents()
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    Red::EntityID target;
+    for (const auto& [playerId, body] : self->m_bodies)
+    {
+        if (body.entityId.IsDefined())
+        {
+            target = body.entityId;
+            break;
+        }
+    }
+
+    if (!target.IsDefined())
+    {
+        return "no remote body spawned";
+    }
+
+    Red::Handle<Red::IScriptable> entitySystem;
+    if (!Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", entitySystem) || !entitySystem)
+    {
+        return "no DynamicEntitySystem";
+    }
+
+    Red::Handle<Red::Entity> entity;
+    if (!Red::CallVirtual(entitySystem.instance, "GetEntity", entity, target) || !entity)
+    {
+        return "body not resolved yet";
+    }
+
+    // Codeware adds GetComponents to Entity.
+    Red::DynArray<Red::Handle<Red::IComponent>> components;
+    if (!Red::CallVirtual(entity.instance, "GetComponents", components))
+    {
+        return "GetComponents failed";
+    }
+
+    const auto count = static_cast<uint32_t>(components.size());
+    CYBERMP_INFO("body %llu has %u component(s):", target.hash, count);
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const auto& component = components[i];
+        if (!component)
+        {
+            continue;
+        }
+
+        const auto* type = component.instance->GetType();
+        CYBERMP_INFO("  [%u] %s", i, type ? type->GetName().ToString() : "<no type>");
+    }
+
+    return Red::CString(std::format("{} component(s), see the log", count).c_str());
+}
+
+Red::CString WorldSystem::SetMoveMode(uint32_t aMode)
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    if (aMode > 3)
+    {
+        return "mode must be 0 (transform), 1 (mover), 2 (both) or 3 (teleport)";
+    }
+
+    self->m_moveMode.store(aMode, std::memory_order_relaxed);
+    self->m_moverWrites = 0;
+    self->m_transformWrites = 0;
+    self->m_moverMissing = 0;
+
+    static constexpr const char* kNames[] = {"transform only", "mover only", "both", "teleport facility"};
+    CYBERMP_INFO("move mode %u (%s)", aMode, kNames[aMode]);
+
+    return Red::CString(std::format("move mode {} ({})", aMode, kNames[aMode]).c_str());
+}
+
+Red::CString WorldSystem::SetBodyKind(uint32_t aKind)
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    if (aKind > 1)
+    {
+        return "kind must be 0 (npc) or 1 (prop)";
+    }
+
+    self->m_bodyKind.store(aKind, std::memory_order_relaxed);
+
+    // Reset the entries instead of erasing them: a body is only created from a join
+    // event, and the player already joined, so erasing would mean it never comes back.
+    uint32_t reset = 0;
+    for (auto& [playerId, body] : self->m_bodies)
+    {
+        DestroyBodyEntity(body.entityId);
+
+        body.entityId = {};
+        body.spawnRequested = false;
+        body.hasPrevious = false;
+        ++reset;
+    }
+
+    static constexpr const char* kNames[] = {"npc", "prop"};
+    CYBERMP_INFO("body kind %u (%s), %u body(ies) reset", aKind, kNames[aKind], reset);
+
+    return Red::CString(
+        std::format("body kind {} ({}), {} reset, wait for respawn", aKind, kNames[aKind], reset).c_str());
 }
 
 RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
@@ -651,4 +909,7 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(Disconnect);
     RTTI_METHOD(GetNetStats);
     RTTI_METHOD(GetRemoteStats);
+    RTTI_METHOD(DumpRemoteComponents);
+    RTTI_METHOD(SetMoveMode);
+    RTTI_METHOD(SetBodyKind);
 });

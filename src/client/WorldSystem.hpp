@@ -50,6 +50,22 @@ public:
     static Red::CString GetNetStats();
     static Red::CString GetRemoteStats();
 
+    // Diagnostic: writing the transform only shows up once the game wakes the npc
+    // (aiming at it does). Lists what a body actually carries, so we drive the right
+    // component instead of guessing its type.
+    static Red::CString DumpRemoteComponents();
+
+    // 0 = SetWorldTransform, 1 = write the moveComponent, 2 = both,
+    // 3 = TeleportationFacility, the game's own way of moving something.
+    // Switchable at runtime so one session answers which one the engine honours,
+    // instead of one build per guess.
+    static Red::CString SetMoveMode(uint32_t aMode);
+
+    // 0 = npc from a Character record, 1 = a prop from a template.
+    // An npc has a motion planner that overwrites whatever we write; a prop has no ai
+    // to fight, which separates "can we move a body" from "can we drive a puppet".
+    static Red::CString SetBodyKind(uint32_t aKind);
+
 private:
     void OnWorldAttached(Red::world::RuntimeScene* aScene) override;
     void OnWorldDetached(Red::world::RuntimeScene* aScene) override;
@@ -72,11 +88,24 @@ private:
     {
         Red::EntityID entityId;
         bool spawnRequested{};
+
+        // Previous snapshot, so a velocity can be derived. The animation system reads
+        // speed off the mover, so without it a moving body would slide.
+        bool hasPrevious{};
+        uint64_t previousTick{};
+        float previousX{};
+        float previousY{};
+        float previousZ{};
     };
 
     std::unordered_map<uint32_t, RemoteBody> m_bodies;
     std::vector<std::pair<uint32_t, client::RemoteSnapshot>> m_snapshotBuffer;
     uint64_t m_lastStateSentMs{};
+    std::atomic_uint32_t m_moveMode{1};
+    std::atomic_uint32_t m_bodyKind{0};
+    std::atomic_uint64_t m_moverWrites{};
+    std::atomic_uint64_t m_transformWrites{};
+    std::atomic_uint64_t m_moverMissing{};
 
     // Every tick counter is written from the game thread and read from the script
     // thread, so they are atomic rather than plain.
