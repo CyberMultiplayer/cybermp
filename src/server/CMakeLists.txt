@@ -2,6 +2,9 @@
 add_library(cybermp_serverlib STATIC
     Session.cpp
     Session.hpp
+    Script.hpp
+    ScriptHost.cpp
+    ScriptHost.hpp
 )
 
 target_include_directories(cybermp_serverlib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")

@@ -13,6 +13,7 @@
 
 #include "Net.hpp"
 #include "Protocol.hpp"
+#include "ScriptHost.hpp"
 #include "Session.hpp"
 
 namespace
@@ -40,8 +41,8 @@ bool Send(net::UdpSocket& aSocket, const net::Endpoint& aTo, const std::vector<u
     return aSocket.SendTo(aTo, {aData.data(), aData.size()});
 }
 
-void HandleHello(net::UdpSocket& aSocket, server::SessionManager& aSessions, const net::Endpoint& aFrom,
-                 std::span<const uint8_t> aData, uint64_t aNowMs)
+void HandleHello(net::UdpSocket& aSocket, server::SessionManager& aSessions, server::ScriptHost& aScripts,
+                 const net::Endpoint& aFrom, std::span<const uint8_t> aData, uint64_t aNowMs)
 {
     proto::Hello hello;
     if (!proto::Decode(aData, hello))
@@ -73,6 +74,12 @@ void HandleHello(net::UdpSocket& aSocket, server::SessionManager& aSessions, con
     if (proto::Encode(ack, out))
     {
         Send(aSocket, aFrom, out);
+    }
+
+    // After the ack, so a script reacting to the join can already talk to the peer.
+    if (result == server::JoinResult::Accepted)
+    {
+        aScripts.OnPlayerJoin(playerId);
     }
 }
 
@@ -133,6 +140,11 @@ int main(int argc, char** argv)
     std::printf("listening on udp %u, %zu slots, %llu ms timeout\n", port, kMaxPlayers, kTimeoutMs);
 
     server::SessionManager sessions(kMaxPlayers, kTimeoutMs);
+
+    server::ScriptHost scripts(sessions);
+    scripts.Add(server::MakeLogBackend());
+    std::printf("%zu scripting backend(s) started\n", scripts.StartAll());
+
     std::vector<uint8_t> buffer(proto::kMaxDatagram);
     uint64_t rejected = 0;
 
@@ -140,17 +152,25 @@ int main(int argc, char** argv)
     {
         const auto now = NowMs();
 
-        // Several peers can expire in one sweep, so the running total is only correct
-        // once the whole batch is gone. Report it after the loop, not per line.
-        const auto dropped = sessions.CollectTimedOut(now);
-        for (const auto& session : dropped)
+        // One at a time so Count() is accurate inside each leave callback.
+        while (const auto dropped = sessions.TakeNextTimedOut(now))
         {
-            std::printf("-- leave #%u '%s' timed out\n", session.id, session.username.c_str());
+            std::printf("-- leave #%u '%s' timed out  (%zu online)\n", dropped->id, dropped->username.c_str(),
+                        sessions.Count());
+            scripts.OnPlayerLeave(dropped->id);
         }
 
-        if (!dropped.empty())
+        scripts.OnTick(now);
+
+        // Drained outside any iteration over sessions, which is why Kick only queues.
+        for (const auto& kick : scripts.TakeKicks())
         {
-            std::printf("-- %zu online\n", sessions.Count());
+            if (auto* session = sessions.Find(kick.playerId))
+            {
+                std::printf("-- kick  #%u '%s': %s\n", session->id, session->username.c_str(), kick.reason.c_str());
+                sessions.Remove(kick.playerId);
+                scripts.OnPlayerLeave(kick.playerId);
+            }
         }
 
         const auto received = socket.RecvFrom(buffer, kPollMs);
@@ -174,7 +194,7 @@ int main(int argc, char** argv)
         switch (header.type)
         {
         case proto::Type::Hello:
-            HandleHello(socket, sessions, received->from, datagram, now);
+            HandleHello(socket, sessions, scripts, received->from, datagram, now);
             break;
 
         case proto::Type::Ping:

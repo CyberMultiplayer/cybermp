@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,8 +48,12 @@ public:
     // Any traffic from a peer keeps it alive.
     bool Touch(const net::Endpoint& aFrom, uint64_t aNowMs);
 
-    // Drops silent peers and hands back who went away, so the caller can announce it.
-    std::vector<Session> CollectTimedOut(uint64_t aNowMs);
+    // Removes and returns one expired peer at a time. Call until it comes back empty.
+    //
+    // Deliberately not a batch: dropping everyone then firing the callbacks makes
+    // Count() already read the final total inside each one, so a script watching for
+    // "last player left" would see it several times.
+    std::optional<Session> TakeNextTimedOut(uint64_t aNowMs);
 
     bool Remove(PlayerId aPlayerId);
 

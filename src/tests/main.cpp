@@ -2,12 +2,14 @@
 // framework. Swap for doctest/catch2 the day this outgrows it.
 
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "Net.hpp"
 #include "Protocol.hpp"
 #include "Serialize.hpp"
+#include "ScriptHost.hpp"
 #include "Session.hpp"
 
 namespace
@@ -442,15 +444,39 @@ void TestSessionTimeout()
     CHECK(sessions.Join(Peer(1), "quiet", proto::kVersion, 0, id) == server::JoinResult::Accepted);
     CHECK(sessions.Join(Peer(2), "chatty", proto::kVersion, 0, id) == server::JoinResult::Accepted);
 
-    CHECK(sessions.CollectTimedOut(500).empty()); // not yet
+    CHECK(!sessions.TakeNextTimedOut(500).has_value()); // not yet
     CHECK(sessions.Touch(Peer(2), 900));
 
-    const auto dropped = sessions.CollectTimedOut(1000);
-    CHECK(dropped.size() == 1);
-    CHECK(!dropped.empty() && dropped[0].username == "quiet");
+    const auto dropped = sessions.TakeNextTimedOut(1000);
+    CHECK(dropped.has_value());
+    CHECK(dropped && dropped->username == "quiet");
     CHECK(sessions.Count() == 1);
     CHECK(sessions.Find(Peer(2)) != nullptr);
     CHECK(sessions.Find(Peer(1)) == nullptr);
+
+    // Only the silent one goes, and the sweep is now exhausted.
+    CHECK(!sessions.TakeNextTimedOut(1000).has_value());
+}
+
+void TestSessionTimeoutIsProgressive()
+{
+    std::printf("sessions: a batch drains one by one so Count() stays truthful\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::PlayerId id = server::kInvalidPlayer;
+
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+    CHECK(sessions.Join(Peer(2), "b", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+    CHECK(sessions.Join(Peer(3), "c", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    // This is what a script watching for "last player left" depends on.
+    CHECK(sessions.TakeNextTimedOut(2000).has_value());
+    CHECK(sessions.Count() == 2);
+    CHECK(sessions.TakeNextTimedOut(2000).has_value());
+    CHECK(sessions.Count() == 1);
+    CHECK(sessions.TakeNextTimedOut(2000).has_value());
+    CHECK(sessions.Count() == 0);
+    CHECK(!sessions.TakeNextTimedOut(2000).has_value());
 }
 
 void TestSessionClockGoingBackwards()
@@ -463,8 +489,172 @@ void TestSessionClockGoingBackwards()
     CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 5000, id) == server::JoinResult::Accepted);
 
     // Unsigned subtraction here would look like a huge elapsed time.
-    CHECK(sessions.CollectTimedOut(1000).empty());
+    CHECK(!sessions.TakeNextTimedOut(1000).has_value());
     CHECK(sessions.Count() == 1);
+}
+
+// Records what it was told, so the tests can assert on dispatch rather than on
+// whatever a real backend happens to print.
+class SpyBackend final : public script::IBackend
+{
+public:
+    explicit SpyBackend(bool aStartSucceeds = true)
+        : m_startSucceeds(aStartSucceeds)
+    {
+    }
+
+    const char* Name() const override
+    {
+        return "spy";
+    }
+
+    bool Start(script::Host& aHost) override
+    {
+        m_host = aHost;
+        started = true;
+        return m_startSucceeds;
+    }
+
+    void Stop() override
+    {
+        stopped = true;
+    }
+
+    void OnPlayerJoin(server::PlayerId aPlayerId) override
+    {
+        joined.push_back(aPlayerId);
+
+        if (auto* player = m_host.players->Find(aPlayerId))
+        {
+            lastUsername = player->GetUsername();
+            countAtJoin = m_host.players->Count();
+
+            if (kickOnJoin)
+            {
+                player->Kick("spy said so");
+            }
+        }
+    }
+
+    void OnPlayerLeave(server::PlayerId aPlayerId) override
+    {
+        left.push_back(aPlayerId);
+    }
+
+    void OnTick(uint64_t aNowMs) override
+    {
+        ticks.push_back(aNowMs);
+    }
+
+    bool started{};
+    bool stopped{};
+    bool kickOnJoin{};
+    std::string lastUsername;
+    size_t countAtJoin{};
+    std::vector<server::PlayerId> joined;
+    std::vector<server::PlayerId> left;
+    std::vector<uint64_t> ticks;
+
+private:
+    bool m_startSucceeds;
+    script::Host m_host;
+};
+
+void TestScriptDispatch()
+{
+    std::printf("scripting: events reach the backend with usable player data\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+
+    auto spy = std::make_unique<SpyBackend>();
+    auto* spyPtr = spy.get();
+    host.Add(std::move(spy));
+
+    CHECK(host.StartAll() == 1);
+    CHECK(spyPtr->started);
+
+    server::PlayerId id = server::kInvalidPlayer;
+    CHECK(sessions.Join(Peer(1), "scripted", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    host.OnPlayerJoin(id);
+    CHECK(spyPtr->joined.size() == 1);
+    CHECK(!spyPtr->joined.empty() && spyPtr->joined[0] == id);
+
+    // The backend must see the session through the boundary, not just an id.
+    CHECK(spyPtr->lastUsername == "scripted");
+    CHECK(spyPtr->countAtJoin == 1);
+
+    host.OnTick(1234);
+    CHECK(spyPtr->ticks.size() == 1);
+    CHECK(!spyPtr->ticks.empty() && spyPtr->ticks[0] == 1234);
+
+    host.OnPlayerLeave(id);
+    CHECK(spyPtr->left.size() == 1);
+}
+
+void TestScriptKickIsQueued()
+{
+    std::printf("scripting: kick is queued, not applied behind the core's back\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+
+    auto spy = std::make_unique<SpyBackend>();
+    auto* spyPtr = spy.get();
+    spyPtr->kickOnJoin = true;
+    host.Add(std::move(spy));
+
+    CHECK(host.StartAll() == 1);
+
+    server::PlayerId id = server::kInvalidPlayer;
+    CHECK(sessions.Join(Peer(1), "doomed", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    host.OnPlayerJoin(id);
+
+    // Still there: the script asked, the core has not acted yet.
+    CHECK(sessions.Count() == 1);
+
+    const auto kicks = host.TakeKicks();
+    CHECK(kicks.size() == 1);
+    CHECK(!kicks.empty() && kicks[0].playerId == id);
+    CHECK(!kicks.empty() && kicks[0].reason == "spy said so");
+
+    // And the queue is emptied by taking it, so nobody gets kicked twice.
+    CHECK(host.TakeKicks().empty());
+}
+
+void TestScriptFailedStartIsDropped()
+{
+    std::printf("scripting: a backend that fails to start is dropped\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+
+    host.Add(std::make_unique<SpyBackend>(false));
+    host.Add(std::make_unique<SpyBackend>(true));
+
+    // Better none than one silently doing nothing.
+    CHECK(host.StartAll() == 1);
+    CHECK(host.BackendCount() == 1);
+}
+
+void TestScriptUnknownPlayer()
+{
+    std::printf("scripting: looking up an unknown player yields null\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::ScriptHost host(sessions);
+
+    auto spy = std::make_unique<SpyBackend>();
+    auto* spyPtr = spy.get();
+    host.Add(std::move(spy));
+    CHECK(host.StartAll() == 1);
+
+    // Dispatching for an id that never existed must not crash or invent data.
+    host.OnPlayerJoin(999);
+    CHECK(spyPtr->joined.size() == 1);
+    CHECK(spyPtr->lastUsername.empty());
 }
 
 void TestSessionRemove()
@@ -504,8 +694,13 @@ int main()
     TestSessionVersionCheckedFirst();
     TestSessionRepeatedHello();
     TestSessionTimeout();
+    TestSessionTimeoutIsProgressive();
     TestSessionClockGoingBackwards();
     TestSessionRemove();
+    TestScriptDispatch();
+    TestScriptKickIsQueued();
+    TestScriptFailedStartIsDropped();
+    TestScriptUnknownPlayer();
 
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
 

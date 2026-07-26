@@ -113,28 +113,22 @@ bool SessionManager::Touch(const net::Endpoint& aFrom, uint64_t aNowMs)
     return true;
 }
 
-std::vector<Session> SessionManager::CollectTimedOut(uint64_t aNowMs)
+std::optional<Session> SessionManager::TakeNextTimedOut(uint64_t aNowMs)
 {
-    std::vector<Session> dropped;
-
     const auto expired = [&](const Session& aSession) {
         // Guard against a now that went backwards rather than wrapping into a
         // gigantic unsigned difference.
         return aNowMs > aSession.lastSeenMs && aNowMs - aSession.lastSeenMs >= m_timeoutMs;
     };
 
-    for (const auto& session : m_sessions)
+    const auto it = std::find_if(m_sessions.begin(), m_sessions.end(), expired);
+    if (it == m_sessions.end())
     {
-        if (expired(session))
-        {
-            dropped.push_back(session);
-        }
+        return std::nullopt;
     }
 
-    if (!dropped.empty())
-    {
-        m_sessions.erase(std::remove_if(m_sessions.begin(), m_sessions.end(), expired), m_sessions.end());
-    }
+    Session dropped = std::move(*it);
+    m_sessions.erase(it);
 
     return dropped;
 }
