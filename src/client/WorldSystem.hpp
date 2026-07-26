@@ -3,7 +3,11 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include "NetClient.hpp"
 
 #include <RedLib.hpp>
 
@@ -44,6 +48,7 @@ public:
     static Red::CString Connect(uint32_t aPort, const Red::CString& aUsername);
     static Red::CString Disconnect();
     static Red::CString GetNetStats();
+    static Red::CString GetRemoteStats();
 
 private:
     void OnWorldAttached(Red::world::RuntimeScene* aScene) override;
@@ -56,6 +61,22 @@ private:
     void OnMultiplayerUpdate(Red::FrameInfo& aFrame, Red::JobQueue& aJobs);
 
     void RunTick(Red::FrameInfo& aFrame, std::atomic_uint64_t& aCounter);
+
+    // All of these run on a tick thread, never on the network thread.
+    void PumpRemotePlayers();
+    void SendLocalState(uint64_t aNowMs);
+
+    // A remote player is drawn by an npc for now. The game has no third person body
+    // for V, so a real player model needs a custom .ent -- deferred on purpose.
+    struct RemoteBody
+    {
+        Red::EntityID entityId;
+        bool spawnRequested{};
+    };
+
+    std::unordered_map<uint32_t, RemoteBody> m_bodies;
+    std::vector<std::pair<uint32_t, client::RemoteSnapshot>> m_snapshotBuffer;
+    uint64_t m_lastStateSentMs{};
 
     // Every tick counter is written from the game thread and read from the script
     // thread, so they are atomic rather than plain.

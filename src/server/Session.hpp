@@ -19,6 +19,13 @@ struct Session
     std::string username;
     net::Endpoint endpoint;
     uint64_t lastSeenMs{};
+
+    // Last snapshot we relayed. stateTick is the client's own counter, kept so an
+    // out of order datagram can be dropped rather than rewinding a body.
+    bool hasState{};
+    uint64_t stateTick{};
+    float position[3]{};
+    float rotation{};
 };
 
 enum class JoinResult
@@ -54,6 +61,10 @@ public:
     // Count() already read the final total inside each one, so a script watching for
     // "last player left" would see it several times.
     std::optional<Session> TakeNextTimedOut(uint64_t aNowMs);
+
+    // False when the snapshot is older than the one already stored, which happens on
+    // udp and must not move a body backwards.
+    bool ApplyState(const net::Endpoint& aFrom, uint64_t aTick, const float (&aPosition)[3], float aRotation);
 
     bool Remove(PlayerId aPlayerId);
 

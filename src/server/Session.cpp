@@ -133,6 +133,32 @@ std::optional<Session> SessionManager::TakeNextTimedOut(uint64_t aNowMs)
     return dropped;
 }
 
+bool SessionManager::ApplyState(const net::Endpoint& aFrom, uint64_t aTick, const float (&aPosition)[3],
+                                float aRotation)
+{
+    auto* session = Find(aFrom);
+    if (!session)
+    {
+        return false;
+    }
+
+    // Udp reorders. An older snapshot carries no information we don't already have,
+    // and applying it would visibly rewind the body.
+    if (session->hasState && aTick <= session->stateTick)
+    {
+        return false;
+    }
+
+    session->hasState = true;
+    session->stateTick = aTick;
+    session->position[0] = aPosition[0];
+    session->position[1] = aPosition[1];
+    session->position[2] = aPosition[2];
+    session->rotation = aRotation;
+
+    return true;
+}
+
 bool SessionManager::Remove(PlayerId aPlayerId)
 {
     const auto it = std::find_if(m_sessions.begin(), m_sessions.end(),

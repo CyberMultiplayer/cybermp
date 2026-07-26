@@ -85,6 +85,21 @@ bool NetClient::Connect(const std::string& aHost, uint16_t aPort, const std::str
     m_helloAttempts = 0;
     m_lastRttMs = 0.0;
     m_appliedOnGameThread = 0;
+    m_statesSent = 0;
+    m_statesReceived = 0;
+    m_statesOutOfOrder = 0;
+    m_stateTick = 0;
+
+    {
+        std::scoped_lock lock(m_remoteMutex);
+        m_remote.clear();
+    }
+
+    {
+        std::scoped_lock lock(m_eventMutex);
+        m_events.clear();
+    }
+
     SetError({});
 
     m_state = NetState::Connecting;
@@ -245,6 +260,77 @@ void NetClient::HandleDatagram(std::span<const uint8_t> aData)
         break;
     }
 
+    case proto::Type::NotifyPlayerJoined:
+    {
+        proto::NotifyPlayerJoined joined;
+        if (!proto::Decode(aData, joined))
+        {
+            m_malformed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        {
+            std::scoped_lock lock(m_eventMutex);
+            m_events.push_back({true, joined.playerId, joined.username});
+        }
+
+        CYBERMP_INFO("player #%u '%s' joined", joined.playerId, joined.username.c_str());
+        break;
+    }
+
+    case proto::Type::NotifyPlayerLeft:
+    {
+        proto::NotifyPlayerLeft left;
+        if (!proto::Decode(aData, left))
+        {
+            m_malformed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        {
+            std::scoped_lock lock(m_remoteMutex);
+            m_remote.erase(left.playerId);
+        }
+
+        {
+            std::scoped_lock lock(m_eventMutex);
+            m_events.push_back({false, left.playerId, {}});
+        }
+
+        CYBERMP_INFO("player #%u left", left.playerId);
+        break;
+    }
+
+    case proto::Type::NotifyPlayerState:
+    {
+        proto::NotifyPlayerState notify;
+        if (!proto::Decode(aData, notify))
+        {
+            m_malformed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        m_statesReceived.fetch_add(1, std::memory_order_relaxed);
+
+        std::scoped_lock lock(m_remoteMutex);
+        auto& snapshot = m_remote[notify.playerId];
+
+        // Udp reorders, and an older snapshot would visibly rewind the body.
+        if (snapshot.tick != 0 && notify.tick <= snapshot.tick)
+        {
+            m_statesOutOfOrder.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        snapshot.tick = notify.tick;
+        snapshot.x = notify.position.x;
+        snapshot.y = notify.position.y;
+        snapshot.z = notify.position.z;
+        snapshot.rotation = notify.rotation;
+
+        break;
+    }
+
     case proto::Type::Pong:
     {
         proto::Pong pong;
@@ -270,6 +356,53 @@ void NetClient::HandleDatagram(std::span<const uint8_t> aData)
     }
 }
 
+bool NetClient::SendState(float aX, float aY, float aZ, float aRotation)
+{
+    if (m_state.load() != NetState::Connected)
+    {
+        return false;
+    }
+
+    proto::PlayerState state;
+    state.tick = m_stateTick.fetch_add(1, std::memory_order_relaxed) + 1;
+    state.position = {aX, aY, aZ};
+    state.rotation = aRotation;
+
+    std::vector<uint8_t> out;
+    if (!proto::Encode(state, out))
+    {
+        return false;
+    }
+
+    m_sent.fetch_add(1, std::memory_order_relaxed);
+    m_statesSent.fetch_add(1, std::memory_order_relaxed);
+
+    return m_socket.SendTo(m_server, {out.data(), out.size()});
+}
+
+std::vector<RemoteEvent> NetClient::TakeEvents()
+{
+    std::vector<RemoteEvent> events;
+
+    std::scoped_lock lock(m_eventMutex);
+    events.swap(m_events);
+
+    return events;
+}
+
+void NetClient::CopyRemoteSnapshots(std::vector<std::pair<uint32_t, RemoteSnapshot>>& aOut) const
+{
+    // Copies into the caller's buffer so the tick can reuse it and allocate nothing
+    // once it has grown.
+    aOut.clear();
+
+    std::scoped_lock lock(m_remoteMutex);
+    for (const auto& [playerId, snapshot] : m_remote)
+    {
+        aOut.emplace_back(playerId, snapshot);
+    }
+}
+
 void NetClient::SetError(std::string aMessage)
 {
     if (!aMessage.empty())
@@ -291,6 +424,14 @@ NetStats NetClient::GetStats() const
     stats.helloAttempts = m_helloAttempts.load();
     stats.lastRttMs = m_lastRttMs.load();
     stats.appliedOnGameThread = m_appliedOnGameThread.load();
+    stats.statesSent = m_statesSent.load();
+    stats.statesReceived = m_statesReceived.load();
+    stats.statesOutOfOrder = m_statesOutOfOrder.load();
+
+    {
+        std::scoped_lock lock(m_remoteMutex);
+        stats.remoteCount = m_remote.size();
+    }
 
     {
         std::scoped_lock lock(m_errorMutex);

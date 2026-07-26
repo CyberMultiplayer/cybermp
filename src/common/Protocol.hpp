@@ -11,7 +11,9 @@ namespace proto
 {
 // Bump on any wire change. The handshake refuses a mismatch outright rather than
 // letting two versions talk and misbehave in ways that look like gameplay bugs.
-constexpr uint32_t kVersion = 1;
+//   1: hello, ping
+//   2: player state snapshots, join and leave notifications
+constexpr uint32_t kVersion = 2;
 
 // Keeps a datagram under the usual MTU, so nothing gets fragmented.
 constexpr size_t kMaxDatagram = 1200;
@@ -24,6 +26,31 @@ enum class Type : uint8_t
     HelloAck = 2,
     Ping = 3,
     Pong = 4,
+    PlayerState = 5,
+    NotifyPlayerState = 6,
+    NotifyPlayerJoined = 7,
+    NotifyPlayerLeft = 8,
+};
+
+// Kept separate from the engine's Vector4: the wire has no business carrying a
+// homogeneous w, and three floats is three floats.
+struct Vec3
+{
+    float x{};
+    float y{};
+    float z{};
+
+    void Write(wire::Writer& aWriter) const
+    {
+        aWriter.F32(x);
+        aWriter.F32(y);
+        aWriter.F32(z);
+    }
+
+    bool Read(wire::Reader& aReader)
+    {
+        return aReader.F32(x) && aReader.F32(y) && aReader.F32(z);
+    }
 };
 
 enum Flags : uint8_t
@@ -63,7 +90,8 @@ struct Header
         }
 
         // An unknown type from the network is data, not a bug: reject, don't assume.
-        if (rawType > static_cast<uint8_t>(Type::Pong))
+        // Bound has to move with the enum, so it names the last member.
+        if (rawType > static_cast<uint8_t>(Type::NotifyPlayerLeft))
         {
             return false;
         }
@@ -157,6 +185,94 @@ struct Pong
     bool Read(wire::Reader& aReader)
     {
         return aReader.U64(sentAt);
+    }
+};
+
+// Unreliable: a dropped snapshot is replaced by the next one 60 ms later, and
+// retransmitting stale positions would be worse than losing them.
+struct PlayerState
+{
+    static constexpr Type kType = Type::PlayerState;
+    static constexpr uint8_t kFlags = Flags::None;
+
+    uint64_t tick{};
+    Vec3 position;
+    float rotation{}; // yaw in degrees, the only axis that matters for a standing body
+
+    void Write(wire::Writer& aWriter) const
+    {
+        aWriter.U64(tick);
+        position.Write(aWriter);
+        aWriter.F32(rotation);
+    }
+
+    bool Read(wire::Reader& aReader)
+    {
+        return aReader.U64(tick) && position.Read(aReader) && aReader.F32(rotation);
+    }
+};
+
+struct NotifyPlayerState
+{
+    static constexpr Type kType = Type::NotifyPlayerState;
+    static constexpr uint8_t kFlags = Flags::None;
+
+    uint32_t playerId{};
+    uint64_t tick{};
+    Vec3 position;
+    float rotation{};
+
+    void Write(wire::Writer& aWriter) const
+    {
+        aWriter.U32(playerId);
+        aWriter.U64(tick);
+        position.Write(aWriter);
+        aWriter.F32(rotation);
+    }
+
+    bool Read(wire::Reader& aReader)
+    {
+        return aReader.U32(playerId) && aReader.U64(tick) && position.Read(aReader) && aReader.F32(rotation);
+    }
+};
+
+// Reliable: missing a join or a leave leaves a ghost body standing forever, which
+// no later snapshot would fix.
+struct NotifyPlayerJoined
+{
+    static constexpr Type kType = Type::NotifyPlayerJoined;
+    static constexpr uint8_t kFlags = Flags::Reliable;
+
+    uint32_t playerId{};
+    std::string username;
+
+    void Write(wire::Writer& aWriter) const
+    {
+        aWriter.U32(playerId);
+        aWriter.Str(username);
+    }
+
+    bool Read(wire::Reader& aReader)
+    {
+        return aReader.U32(playerId) && aReader.Str(username, kMaxStringSize);
+    }
+};
+
+struct NotifyPlayerLeft
+{
+    static constexpr Type kType = Type::NotifyPlayerLeft;
+    static constexpr uint8_t kFlags = Flags::Reliable;
+
+    uint32_t playerId{};
+
+    void Write(wire::Writer& aWriter) const
+    {
+        aWriter.U32(playerId);
+    }
+
+    bool Read(wire::Reader& aReader)
+    {
+        return aReader.U32(playerId);
     }
 };
 

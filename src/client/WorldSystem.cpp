@@ -1,13 +1,19 @@
 #include "WorldSystem.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <format>
 #include <thread>
 
-// RedLib.hpp only pulls a handful of generated headers, these aren't among them.
+// RedLib.hpp only pulls a handful of generated headers, and these keep not being
+// among them. Fifth time: worth a project header that groups what we actually use.
+#include <RED4ext/Scripting/Natives/Generated/Quaternion.hpp>
+#include <RED4ext/Scripting/Natives/Generated/WorldTransform.hpp>
+#include <RED4ext/Scripting/Natives/Generated/ent/Entity.hpp>
 #include <RED4ext/Scripting/Natives/Generated/game/Object.hpp>
 #include <RED4ext/Scripting/Natives/Generated/game/PlayerSystem.hpp>
 #include <RED4ext/Scripting/Natives/Generated/red/ResourceReferenceScriptToken.hpp>
+#include <RED4ext/Scripting/Natives/WorldPosition.hpp>
 
 #include "Log.hpp"
 #include "NetClient.hpp"
@@ -279,6 +285,164 @@ Red::CString WorldSystem::SpawnNpc(const Red::CString& aRecord)
     return Red::CString(std::format("spawn requested, record {}, id {}", record, entityID.hash).c_str());
 }
 
+namespace
+{
+constexpr uint64_t kStateSendIntervalMs = 66; // ~15 Hz, not per frame
+
+// Yaw only: a standing body needs no pitch or roll, and sending three angles for
+// one useful one would be waste on an unreliable channel.
+Red::Quaternion YawToQuaternion(float aDegrees)
+{
+    const auto radians = aDegrees * 0.017453292519943295f; // pi / 180
+    const auto half = radians * 0.5f;
+
+    Red::Quaternion quaternion;
+    quaternion.i = 0.0f;
+    quaternion.j = 0.0f;
+    quaternion.k = std::sin(half); // Z is up in REDengine, so yaw turns around k
+    quaternion.r = std::cos(half);
+
+    return quaternion;
+}
+
+bool MoveEntity(const Red::Handle<Red::Entity>& aEntity, const client::RemoteSnapshot& aSnapshot)
+{
+    if (!aEntity)
+    {
+        return false;
+    }
+
+    Red::WorldTransform transform;
+    transform.Position = Red::WorldPosition(Red::Vector4(aSnapshot.x, aSnapshot.y, aSnapshot.z, 1.0f));
+    transform.Orientation = YawToQuaternion(aSnapshot.rotation);
+
+    // Codeware adds SetWorldTransform to Entity; the base game does not expose it.
+    return Red::CallVirtual(aEntity.instance, "SetWorldTransform", transform);
+}
+} // namespace
+
+void WorldSystem::PumpRemotePlayers()
+{
+    auto& net = Plugin::Net();
+
+    // Events first: a body has to exist before a snapshot can move it.
+    for (const auto& event : net.TakeEvents())
+    {
+        if (event.joined)
+        {
+            m_bodies.try_emplace(event.playerId, RemoteBody{});
+        }
+        else if (const auto it = m_bodies.find(event.playerId); it != m_bodies.end())
+        {
+            if (it->second.entityId.IsDefined())
+            {
+                Red::Handle<Red::IScriptable> system;
+                if (Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", system) && system)
+                {
+                    bool deleted = false;
+                    Red::CallVirtual(system.instance, "DeleteEntity", deleted, it->second.entityId);
+                }
+            }
+
+            m_bodies.erase(it);
+        }
+    }
+
+    if (m_bodies.empty())
+    {
+        return;
+    }
+
+    net.CopyRemoteSnapshots(m_snapshotBuffer);
+
+    Red::Handle<Red::IScriptable> entitySystem;
+    const auto haveSystem = Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", entitySystem) &&
+                            static_cast<bool>(entitySystem);
+
+    for (const auto& [playerId, snapshot] : m_snapshotBuffer)
+    {
+        const auto it = m_bodies.find(playerId);
+        if (it == m_bodies.end() || !haveSystem)
+        {
+            continue;
+        }
+
+        auto& body = it->second;
+
+        // First snapshot is what tells us where to put the body, so spawning waits
+        // for it rather than dropping an npc at the origin.
+        if (!body.spawnRequested)
+        {
+            body.spawnRequested = true;
+
+            auto spec = Red::MakeScriptedHandle<Red::IScriptable>("DynamicEntitySpec");
+            if (!spec)
+            {
+                continue;
+            }
+
+            auto* recordID = Red::GetPropertyPtr<Red::TweakDBID>(spec.instance, "recordID");
+            auto* position = Red::GetPropertyPtr<Red::Vector4>(spec.instance, "position");
+            auto* persistState = Red::GetPropertyPtr<bool>(spec.instance, "persistState");
+            auto* persistSpawn = Red::GetPropertyPtr<bool>(spec.instance, "persistSpawn");
+
+            if (!recordID || !position || !persistState || !persistSpawn)
+            {
+                continue;
+            }
+
+            *recordID = Red::TweakDBID("Character.spr_animals_bouncer1_ranged1_omaha_mb");
+            *position = Red::Vector4(snapshot.x, snapshot.y, snapshot.z, 1.0f);
+            *persistState = false;
+            *persistSpawn = false;
+
+            Red::EntityID entityId;
+            if (Red::CallVirtual(entitySystem.instance, "CreateEntity", entityId, spec) && entityId.IsDefined())
+            {
+                body.entityId = entityId;
+                CYBERMP_INFO("body for player #%u requested, id %llu", playerId, entityId.hash);
+            }
+
+            continue; // spawning is async, so nothing to move yet
+        }
+
+        if (!body.entityId.IsDefined())
+        {
+            continue;
+        }
+
+        Red::Handle<Red::Entity> entity;
+        if (!Red::CallVirtual(entitySystem.instance, "GetEntity", entity, body.entityId) || !entity)
+        {
+            continue; // still spawning
+        }
+
+        MoveEntity(entity, snapshot);
+    }
+}
+
+void WorldSystem::SendLocalState(uint64_t aNowMs)
+{
+    // Rate limited on purpose: 60 Hz of snapshots would be bandwidth spent on
+    // detail no interpolation can use.
+    if (aNowMs - m_lastStateSentMs < kStateSendIntervalMs)
+    {
+        return;
+    }
+
+    const auto position = GetPlayerPosition();
+    if (position.X == 0.0f && position.Y == 0.0f && position.Z == 0.0f)
+    {
+        return; // no player yet, nothing worth sending
+    }
+
+    m_lastStateSentMs = aNowMs;
+
+    // Rotation stays 0 until C3: a body that faces the wrong way is a smaller
+    // problem than one that is not there.
+    Plugin::Net().SendState(position.X, position.Y, position.Z, 0.0f);
+}
+
 // The engine has dedicated multiplayer tick groups left over from the cancelled
 // online mode. Registering on both FrameBegin and one of them tells us whether the
 // multiplayer ones still fire in retail -- if they do, they are semantically exactly
@@ -306,9 +470,16 @@ void WorldSystem::OnFrameBegin(Red::FrameInfo& aFrame, Red::JobQueue&)
     RunTick(aFrame, m_frameBeginTicks);
 }
 
+// Remote bodies are driven from the engine's own multiplayer group, which is what
+// CDPR meant it for: apply received state early in the frame.
 void WorldSystem::OnMultiplayerUpdate(Red::FrameInfo& aFrame, Red::JobQueue&)
 {
     RunTick(aFrame, m_multiplayerTicks);
+
+    PumpRemotePlayers();
+    SendLocalState(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count()));
 }
 
 // No logging and no allocation in here: this is the hottest path in the plugin.
@@ -438,6 +609,34 @@ Red::CString WorldSystem::GetNetStats()
     return Red::CString(text.c_str());
 }
 
+Red::CString WorldSystem::GetRemoteStats()
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    const auto stats = Plugin::Net().GetStats();
+
+    size_t spawned = 0;
+    for (const auto& [playerId, body] : self->m_bodies)
+    {
+        if (body.entityId.IsDefined())
+        {
+            ++spawned;
+        }
+    }
+
+    const auto text = std::format("bodies={} spawned={} snapshots={} statesSent={} outOfOrder={} tracked={}",
+                                  self->m_bodies.size(), spawned, stats.statesReceived, stats.statesSent,
+                                  stats.statesOutOfOrder, stats.remoteCount);
+
+    CYBERMP_INFO("%s", text.c_str());
+
+    return Red::CString(text.c_str());
+}
+
 RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(IsWorldReady);
     RTTI_METHOD(GetPlayerPosition);
@@ -451,4 +650,5 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(Connect);
     RTTI_METHOD(Disconnect);
     RTTI_METHOD(GetNetStats);
+    RTTI_METHOD(GetRemoteStats);
 });

@@ -42,6 +42,27 @@ bool Send(net::UdpSocket& aSocket, const net::Endpoint& aTo, const std::vector<u
     return aSocket.SendTo(aTo, {aData.data(), aData.size()});
 }
 
+// Sends to everyone except one peer, which is almost always the sender: a client
+// does not need its own snapshot echoed back.
+template<typename T>
+void Broadcast(net::UdpSocket& aSocket, server::SessionManager& aSessions, const T& aMessage,
+               server::PlayerId aExcept)
+{
+    std::vector<uint8_t> out;
+    if (!proto::Encode(aMessage, out))
+    {
+        return;
+    }
+
+    for (const auto& session : aSessions.Sessions())
+    {
+        if (session.id != aExcept)
+        {
+            Send(aSocket, session.endpoint, out);
+        }
+    }
+}
+
 void HandleHello(net::UdpSocket& aSocket, server::SessionManager& aSessions, server::ScriptHost& aScripts,
                  const net::Endpoint& aFrom, std::span<const uint8_t> aData, uint64_t aNowMs)
 {
@@ -77,11 +98,68 @@ void HandleHello(net::UdpSocket& aSocket, server::SessionManager& aSessions, ser
         Send(aSocket, aFrom, out);
     }
 
-    // After the ack, so a script reacting to the join can already talk to the peer.
-    if (result == server::JoinResult::Accepted)
+    if (result != server::JoinResult::Accepted)
     {
-        aScripts.OnPlayerJoin(playerId);
+        return;
     }
+
+    // Tell the newcomer who is already here, otherwise it only ever learns about
+    // players that happen to join after it.
+    for (const auto& session : aSessions.Sessions())
+    {
+        if (session.id == playerId)
+        {
+            continue;
+        }
+
+        proto::NotifyPlayerJoined existing;
+        existing.playerId = session.id;
+        existing.username = session.username;
+
+        std::vector<uint8_t> existingOut;
+        if (proto::Encode(existing, existingOut))
+        {
+            Send(aSocket, aFrom, existingOut);
+        }
+    }
+
+    proto::NotifyPlayerJoined joined;
+    joined.playerId = playerId;
+    joined.username = hello.username;
+    Broadcast(aSocket, aSessions, joined, playerId);
+
+    // After the ack, so a script reacting to the join can already talk to the peer.
+    aScripts.OnPlayerJoin(playerId);
+}
+
+void HandlePlayerState(net::UdpSocket& aSocket, server::SessionManager& aSessions, const net::Endpoint& aFrom,
+                       std::span<const uint8_t> aData)
+{
+    auto* session = aSessions.Find(aFrom);
+    if (!session)
+    {
+        return; // unknown peer, nothing to relay on behalf of
+    }
+
+    proto::PlayerState state;
+    if (!proto::Decode(aData, state))
+    {
+        return;
+    }
+
+    if (!aSessions.ApplyState(aFrom, state.tick, {state.position.x, state.position.y, state.position.z},
+                              state.rotation))
+    {
+        return; // out of order, already superseded
+    }
+
+    proto::NotifyPlayerState notify;
+    notify.playerId = session->id;
+    notify.tick = state.tick;
+    notify.position = state.position;
+    notify.rotation = state.rotation;
+
+    Broadcast(aSocket, aSessions, notify, session->id);
 }
 
 void HandlePing(net::UdpSocket& aSocket, server::SessionManager& aSessions, const net::Endpoint& aFrom,
@@ -159,6 +237,11 @@ int main(int argc, char** argv)
         {
             std::printf("-- leave #%u '%s' timed out  (%zu online)\n", dropped->id, dropped->username.c_str(),
                         sessions.Count());
+
+            proto::NotifyPlayerLeft left;
+            left.playerId = dropped->id;
+            Broadcast(socket, sessions, left, dropped->id);
+
             scripts.OnPlayerLeave(dropped->id);
         }
 
@@ -171,6 +254,11 @@ int main(int argc, char** argv)
             {
                 std::printf("-- kick  #%u '%s': %s\n", session->id, session->username.c_str(), kick.reason.c_str());
                 sessions.Remove(kick.playerId);
+
+                proto::NotifyPlayerLeft left;
+                left.playerId = kick.playerId;
+                Broadcast(socket, sessions, left, kick.playerId);
+
                 scripts.OnPlayerLeave(kick.playerId);
             }
         }
@@ -201,6 +289,10 @@ int main(int argc, char** argv)
 
         case proto::Type::Ping:
             HandlePing(socket, sessions, received->from, datagram);
+            break;
+
+        case proto::Type::PlayerState:
+            HandlePlayerState(socket, sessions, received->from, datagram);
             break;
 
         default:

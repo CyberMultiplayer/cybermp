@@ -1010,6 +1010,78 @@ void TestTaskQueueConcurrentDrains()
     CHECK(queue.Pending() == 0);
 }
 
+void TestStateMessagesRoundTrip()
+{
+    std::printf("protocol: state snapshots round trip\n");
+
+    std::vector<uint8_t> buffer;
+
+    proto::PlayerState sent;
+    sent.tick = 12345;
+    sent.position = {-1362.35f, 1283.91f, 29.50f};
+    sent.rotation = 137.5f;
+    CHECK(proto::Encode(sent, buffer));
+
+    proto::Header header;
+    CHECK(proto::PeekHeader(buffer, header));
+    CHECK(!header.IsReliable()); // snapshots are deliberately unreliable
+
+    proto::PlayerState received;
+    CHECK(proto::Decode(buffer, received));
+    CHECK(received.tick == 12345);
+    CHECK(received.position.x == -1362.35f);
+    CHECK(received.position.y == 1283.91f);
+    CHECK(received.position.z == 29.50f);
+    CHECK(received.rotation == 137.5f);
+
+    proto::NotifyPlayerJoined joined;
+    joined.playerId = 7;
+    joined.username = "akitium";
+    CHECK(proto::Encode(joined, buffer));
+    CHECK(proto::PeekHeader(buffer, header));
+    CHECK(header.IsReliable()); // a missed join leaves a ghost forever
+
+    proto::NotifyPlayerJoined decodedJoin;
+    CHECK(proto::Decode(buffer, decodedJoin));
+    CHECK(decodedJoin.playerId == 7);
+    CHECK(decodedJoin.username == "akitium");
+
+    proto::NotifyPlayerLeft left;
+    left.playerId = 7;
+    CHECK(proto::Encode(left, buffer));
+    CHECK(proto::PeekHeader(buffer, header));
+    CHECK(header.IsReliable());
+}
+
+void TestSessionStateOrdering()
+{
+    std::printf("sessions: an out of order snapshot is refused\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::PlayerId id = server::kInvalidPlayer;
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    const float first[3] = {1.0f, 2.0f, 3.0f};
+    const float second[3] = {4.0f, 5.0f, 6.0f};
+    const float stale[3] = {9.0f, 9.0f, 9.0f};
+
+    CHECK(sessions.ApplyState(Peer(1), 10, first, 90.0f));
+    CHECK(sessions.ApplyState(Peer(1), 11, second, 180.0f));
+
+    // Udp reorders, and applying this would visibly rewind the body.
+    CHECK(!sessions.ApplyState(Peer(1), 5, stale, 0.0f));
+    CHECK(!sessions.ApplyState(Peer(1), 11, stale, 0.0f)); // same tick is not newer
+
+    auto* session = sessions.Find(id);
+    CHECK(session != nullptr);
+    CHECK(session && session->stateTick == 11);
+    CHECK(session && session->position[0] == 4.0f);
+    CHECK(session && session->rotation == 180.0f);
+
+    // And an unknown peer has nothing to apply to.
+    CHECK(!sessions.ApplyState(Peer(99), 1, first, 0.0f));
+}
+
 void TestSessionRemove()
 {
     std::printf("sessions: explicit removal\n");
@@ -1050,6 +1122,8 @@ int main()
     TestSessionTimeoutIsProgressive();
     TestSessionClockGoingBackwards();
     TestSessionRemove();
+    TestStateMessagesRoundTrip();
+    TestSessionStateOrdering();
     TestScriptDispatch();
     TestScriptKickIsQueued();
     TestScriptFailedStartIsDropped();
