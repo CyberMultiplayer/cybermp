@@ -3,6 +3,8 @@
 add_library(cybermp_common STATIC
     Net.cpp
     Net.hpp
+    Protocol.hpp
+    Serialize.hpp
 )
 
 target_include_directories(cybermp_common PUBLIC

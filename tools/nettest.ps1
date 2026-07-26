@@ -31,9 +31,15 @@ try {
     & $client $Port $Rounds
     if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: server was up but rounds went unanswered'; $failed++ }
 
+    Write-Host ''
+    Write-Host '--- wrong protocol version: expecting refusal ---'
+    & $client $Port 1 999
+    if ($LASTEXITCODE -ne 2) { Write-Host "FAIL: expected exit 2 (refused), got $LASTEXITCODE"; $failed++ }
+
     Stop-Process -Id $process.Id -Force
     Start-Sleep -Milliseconds 500
 
+    Write-Host ''
     Write-Host '--- server down: expecting timeouts ---'
     & $client $Port 1
     if ($LASTEXITCODE -eq 0) { Write-Host 'FAIL: got a reply with no server running'; $failed++ }

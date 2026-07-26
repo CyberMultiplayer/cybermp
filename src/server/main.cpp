@@ -1,27 +1,84 @@
-// cybermp server -- B0.2: listens and answers PING with PONG.
-// Raw UDP for now. GameNetworkingSockets comes in once we need reliability
-// and encryption; the point here is to prove the loop, not the transport.
+// cybermp server -- speaks the B1 protocol: handshake then ping/pong.
+// Raw UDP for now. GameNetworkingSockets comes in once we need reliability and
+// encryption; the point here is the message loop, not the transport.
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
-#include <string_view>
 #include <vector>
 
 #include <Version.hpp>
 
 #include "Net.hpp"
+#include "Protocol.hpp"
 
 namespace
 {
 constexpr uint16_t kDefaultPort = 11780;
-constexpr size_t kMaxDatagram = 1200; // stays under the usual MTU
 
 std::atomic_bool g_running{true};
 
 void OnSignal(int)
 {
     g_running = false;
+}
+
+bool Send(net::UdpSocket& aSocket, const net::Endpoint& aTo, const std::vector<uint8_t>& aData)
+{
+    return aSocket.SendTo(aTo, {aData.data(), aData.size()});
+}
+
+void HandleHello(net::UdpSocket& aSocket, const net::Endpoint& aFrom, std::span<const uint8_t> aData)
+{
+    proto::Hello hello;
+    if (!proto::Decode(aData, hello))
+    {
+        std::printf("!! malformed hello from %s\n", aFrom.ToString().c_str());
+        return;
+    }
+
+    proto::HelloAck ack;
+    ack.accepted = hello.version == proto::kVersion;
+
+    if (!ack.accepted)
+    {
+        // Say why, so a mismatched client can report something useful instead of
+        // silently failing to connect.
+        ack.reason = "protocol version mismatch";
+        std::printf("-- refused '%s': client protocol %u, server %u\n", hello.username.c_str(), hello.version,
+                    proto::kVersion);
+    }
+    else
+    {
+        std::printf("-- accepted '%s' from %s\n", hello.username.c_str(), aFrom.ToString().c_str());
+    }
+
+    std::vector<uint8_t> out;
+    if (proto::Encode(ack, out))
+    {
+        Send(aSocket, aFrom, out);
+    }
+}
+
+void HandlePing(net::UdpSocket& aSocket, const net::Endpoint& aFrom, std::span<const uint8_t> aData)
+{
+    proto::Ping ping;
+    if (!proto::Decode(aData, ping))
+    {
+        std::printf("!! malformed ping from %s\n", aFrom.ToString().c_str());
+        return;
+    }
+
+    // Echo the client's own timestamp back: it measures the rtt, we stay stateless.
+    proto::Pong pong;
+    pong.sentAt = ping.sentAt;
+
+    std::vector<uint8_t> out;
+    if (proto::Encode(pong, out))
+    {
+        Send(aSocket, aFrom, out);
+    }
 }
 } // namespace
 
@@ -36,7 +93,7 @@ int main(int argc, char** argv)
     std::signal(SIGINT, OnSignal);
     std::signal(SIGTERM, OnSignal);
 
-    std::printf("cybermp server %s (%s)\n", CYBERMP_VERSION, CYBERMP_GIT_HASH);
+    std::printf("cybermp server %s (%s), protocol %u\n", CYBERMP_VERSION, CYBERMP_GIT_HASH, proto::kVersion);
 
     net::Startup startup;
     if (!startup.ok())
@@ -54,40 +111,51 @@ int main(int argc, char** argv)
 
     std::printf("listening on udp %u, ctrl+c to stop\n", port);
 
-    std::vector<uint8_t> buffer(kMaxDatagram);
+    std::vector<uint8_t> buffer(proto::kMaxDatagram);
     uint64_t handled = 0;
+    uint64_t rejected = 0;
 
     while (g_running)
     {
         const auto received = socket.RecvFrom(buffer, 250);
         if (!received)
         {
-            continue; // timeout, just poll again
+            continue; // timeout, poll again
         }
 
-        const std::string_view payload(reinterpret_cast<const char*>(buffer.data()), received->size);
-        std::printf("<- %s  %zu bytes  '%.*s'\n", received->from.ToString().c_str(), received->size,
-                    static_cast<int>(payload.size()), payload.data());
+        const std::span<const uint8_t> datagram(buffer.data(), received->size);
 
-        if (payload == "PING")
+        proto::Header header;
+        if (!proto::PeekHeader(datagram, header))
         {
-            constexpr std::string_view pong = "PONG";
-            const auto* bytes = reinterpret_cast<const uint8_t*>(pong.data());
+            // Anything off the wire can be junk. Drop it and keep serving.
+            std::printf("!! unreadable datagram from %s, %zu bytes\n", received->from.ToString().c_str(),
+                        received->size);
+            ++rejected;
+            continue;
+        }
 
-            if (socket.SendTo(received->from, {bytes, pong.size()}))
-            {
-                std::printf("-> %s  PONG\n", received->from.ToString().c_str());
-            }
-            else
-            {
-                std::printf("!! send failed\n");
-            }
+        switch (header.type)
+        {
+        case proto::Type::Hello:
+            HandleHello(socket, received->from, datagram);
+            break;
+
+        case proto::Type::Ping:
+            HandlePing(socket, received->from, datagram);
+            break;
+
+        default:
+            std::printf("!! unexpected type %u from %s\n", static_cast<unsigned>(header.type),
+                        received->from.ToString().c_str());
+            ++rejected;
+            break;
         }
 
         ++handled;
     }
 
-    std::printf("stopped after %llu datagram(s)\n", handled);
+    std::printf("stopped, %llu handled, %llu rejected\n", handled, rejected);
 
     return 0;
 }

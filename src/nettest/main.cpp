@@ -1,28 +1,56 @@
-// B0.3 -- console client: sends PING, waits for PONG, reports RTT.
-// Stands in for the game client so the transport can be exercised without launching it.
+// Console client: handshake, then ping/pong with rtt. Stands in for the game so
+// the protocol can be exercised without launching it.
+//
+//   cybermp_nettest [port] [rounds] [protocolOverride]
+//
+// The override exists to check the server actually refuses a mismatched version.
 
 #include <chrono>
 #include <cstdio>
-#include <string_view>
 #include <vector>
 
 #include <Version.hpp>
 
 #include "Net.hpp"
+#include "Protocol.hpp"
 
 namespace
 {
 constexpr uint16_t kDefaultPort = 11780;
 constexpr uint32_t kTimeoutMs = 1000;
-constexpr size_t kMaxDatagram = 1200;
+
+uint64_t NowMicros()
+{
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+}
+
+bool Exchange(net::UdpSocket& aSocket, const net::Endpoint& aServer, const std::vector<uint8_t>& aRequest,
+              std::vector<uint8_t>& aBuffer, size_t& aReceived)
+{
+    if (!aSocket.SendTo(aServer, {aRequest.data(), aRequest.size()}))
+    {
+        return false;
+    }
+
+    const auto received = aSocket.RecvFrom(aBuffer, kTimeoutMs);
+    if (!received)
+    {
+        return false;
+    }
+
+    aReceived = received->size;
+    return true;
+}
 } // namespace
 
 int main(int argc, char** argv)
 {
     const auto port = argc > 1 ? static_cast<uint16_t>(std::atoi(argv[1])) : kDefaultPort;
     const auto rounds = argc > 2 ? std::atoi(argv[2]) : 3;
+    const auto protocolOverride = argc > 3 ? static_cast<uint32_t>(std::atoi(argv[3])) : proto::kVersion;
 
-    std::printf("cybermp nettest %s (%s)\n", CYBERMP_VERSION, CYBERMP_GIT_HASH);
+    std::printf("cybermp nettest %s (%s), protocol %u\n", CYBERMP_VERSION, CYBERMP_GIT_HASH, protocolOverride);
 
     net::Startup startup;
     if (!startup.ok())
@@ -39,40 +67,79 @@ int main(int argc, char** argv)
     }
 
     const auto server = net::UdpSocket::Loopback(port);
-    std::vector<uint8_t> buffer(kMaxDatagram);
+    std::vector<uint8_t> buffer(proto::kMaxDatagram);
+    std::vector<uint8_t> request;
+    size_t received = 0;
 
+    // --- handshake ---
+    proto::Hello hello;
+    hello.version = protocolOverride;
+    hello.username = "nettest";
+
+    if (!proto::Encode(hello, request))
+    {
+        std::printf("could not encode hello\n");
+        return 1;
+    }
+
+    if (!Exchange(socket, server, request, buffer, received))
+    {
+        std::printf("handshake: no answer after %u ms\n", kTimeoutMs);
+        return 1;
+    }
+
+    proto::HelloAck ack;
+    if (!proto::Decode({buffer.data(), received}, ack))
+    {
+        std::printf("handshake: malformed answer\n");
+        return 1;
+    }
+
+    if (!ack.accepted)
+    {
+        std::printf("handshake refused: %s (server protocol %u)\n", ack.reason.c_str(), ack.version);
+        return 2; // distinct from a transport failure
+    }
+
+    std::printf("handshake ok, server protocol %u\n", ack.version);
+
+    // --- ping / pong ---
     int answered = 0;
 
     for (int round = 1; round <= rounds; ++round)
     {
-        constexpr std::string_view ping = "PING";
-        const auto* bytes = reinterpret_cast<const uint8_t*>(ping.data());
+        proto::Ping ping;
+        ping.sentAt = NowMicros();
 
-        const auto sentAt = std::chrono::steady_clock::now();
-
-        if (!socket.SendTo(server, {bytes, ping.size()}))
+        if (!proto::Encode(ping, request))
         {
-            std::printf("%d: send failed\n", round);
+            std::printf("%d: could not encode ping\n", round);
             continue;
         }
 
-        const auto received = socket.RecvFrom(buffer, kTimeoutMs);
-        if (!received)
+        if (!Exchange(socket, server, request, buffer, received))
         {
             std::printf("%d: timeout after %u ms\n", round, kTimeoutMs);
             continue;
         }
 
-        const auto rtt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sentAt).count();
-        const std::string_view payload(reinterpret_cast<const char*>(buffer.data()), received->size);
-
-        std::printf("%d: '%.*s' from %s, rtt %.3f ms\n", round, static_cast<int>(payload.size()), payload.data(),
-                    received->from.ToString().c_str(), rtt);
-
-        if (payload == "PONG")
+        proto::Pong pong;
+        if (!proto::Decode({buffer.data(), received}, pong))
         {
-            ++answered;
+            std::printf("%d: malformed pong\n", round);
+            continue;
         }
+
+        if (pong.sentAt != ping.sentAt)
+        {
+            std::printf("%d: pong timestamp mismatch\n", round);
+            continue;
+        }
+
+        const auto rtt = static_cast<double>(NowMicros() - pong.sentAt) / 1000.0;
+        std::printf("%d: pong, rtt %.3f ms\n", round, rtt);
+
+        ++answered;
     }
 
     std::printf("%d/%d answered\n", answered, rounds);
