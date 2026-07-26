@@ -9,7 +9,7 @@ add_library(cybermp SHARED
     WorldSystem.hpp
 )
 
-target_link_libraries(cybermp PRIVATE RED4ext::SDK RedLib)
+target_link_libraries(cybermp PRIVATE RED4ext::SDK RedLib cybermp_common)
 
 target_include_directories(cybermp PRIVATE "${CMAKE_BINARY_DIR}/generated")
 

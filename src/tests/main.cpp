@@ -2,12 +2,14 @@
 // framework. Swap for doctest/catch2 the day this outgrows it.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -17,6 +19,7 @@
 #include "Serialize.hpp"
 #include "ScriptHost.hpp"
 #include "Session.hpp"
+#include "TaskQueue.hpp"
 
 namespace
 {
@@ -827,6 +830,186 @@ void TestLuaMissingDirectoryIsFine()
     CHECK(host.StartAll() == 1);
 }
 
+void TestTaskQueueBasics()
+{
+    std::printf("task queue: push, drain, order\n");
+
+    core::TaskQueue queue;
+    std::vector<int> ran;
+
+    CHECK(queue.Drain() == 0); // nothing queued
+    CHECK(queue.Pending() == 0);
+
+    queue.Push([&] { ran.push_back(1); });
+    queue.Push([&] { ran.push_back(2); });
+    queue.Push(nullptr); // must be ignored, not queued as a crash
+
+    CHECK(queue.Pending() == 2);
+    CHECK(queue.Drain() == 2);
+    CHECK(ran.size() == 2);
+    CHECK(ran.size() == 2 && ran[0] == 1 && ran[1] == 2);
+    CHECK(queue.Pending() == 0);
+}
+
+void TestTaskQueueReentrantPush()
+{
+    std::printf("task queue: a task can push without deadlocking\n");
+
+    core::TaskQueue queue;
+    int outer = 0;
+    int inner = 0;
+
+    queue.Push([&] {
+        ++outer;
+        // Runs outside the lock, so this is legal. It must land in the next drain,
+        // not this one, otherwise a task that always pushes would never end.
+        queue.Push([&] { ++inner; });
+    });
+
+    CHECK(queue.Drain() == 1);
+    CHECK(outer == 1);
+    CHECK(inner == 0);
+    CHECK(queue.Pending() == 1);
+
+    CHECK(queue.Drain() == 1);
+    CHECK(inner == 1);
+}
+
+void TestTaskQueueBudget()
+{
+    std::printf("task queue: a budget caps work per frame\n");
+
+    core::TaskQueue queue;
+    int ran = 0;
+
+    for (int i = 0; i < 10; ++i)
+    {
+        queue.Push([&] { ++ran; });
+    }
+
+    CHECK(queue.Drain(4) == 4);
+    CHECK(ran == 4);
+    CHECK(queue.Pending() == 6);
+
+    // A budget larger than what's queued is not an error.
+    CHECK(queue.Drain(100) == 6);
+    CHECK(ran == 10);
+    CHECK(queue.Pending() == 0);
+}
+
+void TestTaskQueueThreadedProducers()
+{
+    std::printf("task queue: several producer threads, nothing lost\n");
+
+    core::TaskQueue queue;
+    std::atomic_int ran{0};
+
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 250;
+
+    std::vector<std::thread> producers;
+    for (int t = 0; t < kThreads; ++t)
+    {
+        producers.emplace_back([&] {
+            for (int i = 0; i < kPerThread; ++i)
+            {
+                queue.Push([&] { ran.fetch_add(1, std::memory_order_relaxed); });
+            }
+        });
+    }
+
+    for (auto& producer : producers)
+    {
+        producer.join();
+    }
+
+    CHECK(queue.Pending() == kThreads * kPerThread);
+    CHECK(queue.Drain() == kThreads * kPerThread);
+    CHECK(ran.load() == kThreads * kPerThread);
+}
+
+void TestTaskQueueDrainWhileProducing()
+{
+    std::printf("task queue: draining while a thread is still pushing loses nothing\n");
+
+    core::TaskQueue queue;
+    std::atomic_int ran{0};
+    constexpr int kTotal = 2000;
+
+    std::thread producer([&] {
+        for (int i = 0; i < kTotal; ++i)
+        {
+            queue.Push([&] { ran.fetch_add(1, std::memory_order_relaxed); });
+        }
+    });
+
+    // Mimics the game thread ticking while the network thread feeds it.
+    while (ran.load() < kTotal)
+    {
+        queue.Drain(64);
+    }
+
+    producer.join();
+    queue.Drain();
+
+    CHECK(ran.load() == kTotal);
+    CHECK(queue.Pending() == 0);
+}
+
+void TestTaskQueueConcurrentDrains()
+{
+    std::printf("task queue: several threads draining at once lose and duplicate nothing\n");
+
+    // The engine dispatches its update groups on a worker pool, so two of our tick
+    // callbacks really can drain in parallel. Found in game, covered here.
+    core::TaskQueue queue;
+    std::atomic_int ran{0};
+    constexpr int kTotal = 5000;
+
+    for (int i = 0; i < kTotal; ++i)
+    {
+        queue.Push([&] { ran.fetch_add(1, std::memory_order_relaxed); });
+    }
+
+    std::atomic_int drained{0};
+    std::vector<std::thread> drainers;
+
+    for (int t = 0; t < 4; ++t)
+    {
+        drainers.emplace_back([&] {
+            size_t mine = 0;
+            while (drained.load() < kTotal)
+            {
+                const auto n = queue.Drain(16);
+                if (n == 0)
+                {
+                    if (queue.Pending() == 0)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                mine += n;
+                drained.fetch_add(static_cast<int>(n), std::memory_order_relaxed);
+            }
+
+            (void)mine;
+        });
+    }
+
+    for (auto& drainer : drainers)
+    {
+        drainer.join();
+    }
+
+    queue.Drain();
+
+    // Each task exactly once: no loss, no double execution.
+    CHECK(ran.load() == kTotal);
+    CHECK(queue.Pending() == 0);
+}
+
 void TestSessionRemove()
 {
     std::printf("sessions: explicit removal\n");
@@ -877,6 +1060,12 @@ int main()
     TestLuaBadApiUseIsReadable();
     TestLuaKickReachesTheCore();
     TestLuaMissingDirectoryIsFine();
+    TestTaskQueueBasics();
+    TestTaskQueueReentrantPush();
+    TestTaskQueueBudget();
+    TestTaskQueueThreadedProducers();
+    TestTaskQueueDrainWhileProducing();
+    TestTaskQueueConcurrentDrains();
 
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
 

@@ -1,6 +1,8 @@
 #include "WorldSystem.hpp"
 
+#include <chrono>
 #include <format>
+#include <thread>
 
 // RedLib.hpp only pulls a handful of generated headers, these aren't among them.
 #include <RED4ext/Scripting/Natives/Generated/game/Object.hpp>
@@ -11,6 +13,11 @@
 
 namespace
 {
+size_t CurrentThreadId()
+{
+    return std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+
 // PlayerSystem has no typed methods in the sdk, so go through the rtti.
 Red::Handle<Red::GameObject> GetLocalPlayer()
 {
@@ -270,6 +277,127 @@ Red::CString WorldSystem::SpawnNpc(const Red::CString& aRecord)
     return Red::CString(std::format("spawn requested, record {}, id {}", record, entityID.hash).c_str());
 }
 
+// The engine has dedicated multiplayer tick groups left over from the cancelled
+// online mode. Registering on both FrameBegin and one of them tells us whether the
+// multiplayer ones still fire in retail -- if they do, they are semantically exactly
+// what we want: capture our state late, apply received state early.
+void WorldSystem::OnRegisterUpdates(Red::UpdateRegistrar* aRegistrar)
+{
+    IGameSystem::OnRegisterUpdates(aRegistrar);
+
+    if (!aRegistrar)
+    {
+        return;
+    }
+
+    aRegistrar->RegisterUpdate(Red::UpdateTickGroup::FrameBegin, this, "cybermp/FrameBegin",
+                               Red::GroupUpdateCallback(this, &WorldSystem::OnFrameBegin));
+
+    aRegistrar->RegisterUpdate(Red::UpdateTickGroup::Multiplayer_UpdateStateSnapshots, this, "cybermp/MpUpdate",
+                               Red::GroupUpdateCallback(this, &WorldSystem::OnMultiplayerUpdate));
+
+    CYBERMP_INFO("registered frame updates");
+}
+
+void WorldSystem::OnFrameBegin(Red::FrameInfo& aFrame, Red::JobQueue&)
+{
+    RunTick(aFrame, m_frameBeginTicks);
+}
+
+void WorldSystem::OnMultiplayerUpdate(Red::FrameInfo& aFrame, Red::JobQueue&)
+{
+    RunTick(aFrame, m_multiplayerTicks);
+}
+
+// No logging and no allocation in here: this is the hottest path in the plugin.
+void WorldSystem::RunTick(Red::FrameInfo& aFrame, std::atomic_uint64_t& aCounter)
+{
+    const auto started = std::chrono::steady_clock::now();
+
+    const auto thisThread = CurrentThreadId();
+
+    aCounter.fetch_add(1, std::memory_order_relaxed);
+    m_lastDeltaTime.store(aFrame.deltaTime, std::memory_order_relaxed);
+
+    // Counting the changes is how we show the pool rotates rather than guessing.
+    if (m_tickThreadId.exchange(thisThread, std::memory_order_relaxed) != thisThread)
+    {
+        m_tickThreadChanges.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    m_drainThreadId.store(thisThread, std::memory_order_relaxed);
+
+    // Bounded on purpose: a burst off the network must not be allowed to stall a frame.
+    const auto ran = m_tasks.Drain(64);
+    if (ran > 0)
+    {
+        m_tasksRun.fetch_add(ran, std::memory_order_relaxed);
+    }
+
+    const auto micros = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+
+    // Plain max rather than an average: a single long frame is what players notice.
+    auto previous = m_maxTickMicros.load(std::memory_order_relaxed);
+    while (micros > previous && !m_maxTickMicros.compare_exchange_weak(previous, micros, std::memory_order_relaxed))
+    {
+    }
+}
+
+Red::CString WorldSystem::GetTickStats()
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    const auto text = std::format(
+        "frameBegin={} mpUpdate={} tasksRun={} pending={} dt={:.4f} maxTick={}us "
+        "tickThreadChanges={} producerThread={} tasksAlwaysOnDrainThread={}",
+        self->m_frameBeginTicks.load(), self->m_multiplayerTicks.load(), self->m_tasksRun.load(),
+        self->m_tasks.Pending(), self->m_lastDeltaTime.load(), self->m_maxTickMicros.load(),
+        self->m_tickThreadChanges.load(), self->m_producerThreadId.load(),
+        self->m_taskRanOffDrainThread.load() ? "no" : "yes");
+
+    CYBERMP_INFO("%s", text.c_str());
+
+    return Red::CString(text.c_str());
+}
+
+Red::CString WorldSystem::PostTasksFromThread(int32_t aCount)
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    if (aCount <= 0 || aCount > 10000)
+    {
+        return "count must be 1..10000";
+    }
+
+    // Replaces any previous producer, which joins here rather than leaking.
+    self->m_producer = std::jthread([self, aCount] {
+        self->m_producerThreadId.store(CurrentThreadId(), std::memory_order_relaxed);
+
+        for (int32_t i = 0; i < aCount; ++i)
+        {
+            // The invariant that matters: a task body must run on the thread that is
+            // draining it, never on the one that queued it.
+            self->m_tasks.Push([self] {
+                if (CurrentThreadId() != self->m_drainThreadId.load(std::memory_order_relaxed))
+                {
+                    self->m_taskRanOffDrainThread.store(true, std::memory_order_relaxed);
+                }
+            });
+        }
+    });
+
+    return Red::CString(std::format("queued {} task(s) from a worker thread", aCount).c_str());
+}
+
 RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(IsWorldReady);
     RTTI_METHOD(GetPlayerPosition);
@@ -278,4 +406,6 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(SpawnNpc);
     RTTI_METHOD(GetSpawnedCount);
     RTTI_METHOD(DespawnAll);
+    RTTI_METHOD(GetTickStats);
+    RTTI_METHOD(PostTasksFromThread);
 });
