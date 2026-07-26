@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Runner ships VS2022, so this also proves we don't depend on a newer toolset.
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Check output is x64
+        shell: pwsh
+        run: |
+          $dll = 'build/src/client/Release/cybermp.dll'
+          if (-not (Test-Path $dll)) { throw "cybermp.dll was not produced" }
+          $bytes = [IO.File]::ReadAllBytes($dll)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          if ($machine -ne 0x8664) { throw ("expected x64 (0x8664), got 0x{0:X4}" -f $machine) }
+          Write-Host "ok - x64"
+
+      - name: Check RED4ext exports
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
+                     Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin not found" }
+          $exports = & $dumpbin.FullName /EXPORTS 'build/src/client/Release/cybermp.dll'
+          foreach ($name in 'Supports', 'Query', 'Main') {
+            if ($exports -notmatch "\b$name = $name\b") { throw "missing undecorated export: $name" }
+          }
+          Write-Host "ok - Supports / Query / Main"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cybermp
+          path: |
+            build/src/client/Release/cybermp.dll
+            build/src/client/Release/cybermp.pdb
