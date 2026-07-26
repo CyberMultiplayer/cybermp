@@ -1,0 +1,7 @@
+# Normalize line endings in the repo, checkout native
+* text=auto eol=lf
+
+# Windows-only scripts must stay CRLF
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
