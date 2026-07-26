@@ -18,7 +18,7 @@ Thank you for your interest in contributing! This document explains how to get y
 
 ## Code of conduct
 
-Be respectful and constructive. Harassment or hostile behaviour of any kind will not be tolerated.
+Be respectful and constructive. Harassment or hostile behavior of any kind will not be tolerated.
 
 ---
 
@@ -30,7 +30,7 @@ Be respectful and constructive. Harassment or hostile behaviour of any kind will
    - RED4ext version
    - cybermp version or commit hash
    - Steps to reproduce
-   - Expected vs. actual behaviour
+   - Expected vs. actual behavior
    - Relevant log output (RED4ext log at `<game>/red4ext/logs/cybermp.log`)
 
 ---
@@ -114,7 +114,7 @@ Use the following prefix format inspired by [Conventional Commits](https://www.c
 |--------|-------------|
 | `feat:` | A new feature |
 | `fix:` | A bug fix |
-| `refactor:` | Code restructuring without behaviour change |
+| `refactor:` | Code restructuring without behavior change |
 | `docs:` | Documentation only |
 | `ci:` | CI / workflow changes |
 | `chore:` | Maintenance (deps, tooling, …) |
