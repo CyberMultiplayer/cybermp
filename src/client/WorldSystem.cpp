@@ -290,6 +290,19 @@ namespace
 {
 constexpr uint64_t kStateSendIntervalMs = 66; // ~15 Hz, not per frame
 
+// Render the past rather than the present. Snapshots arrive every ~66 ms, so
+// holding one and a half intervals means there is almost always a later sample to
+// interpolate towards instead of extrapolating into nothing.
+constexpr uint64_t kInterpolationDelayMs = 100;
+constexpr size_t kMaxSamples = 8;
+
+float LerpAngleDegrees(float aFrom, float aTo, float aT)
+{
+    // Shortest way round, so 350 -> 10 turns 20 degrees and not 340.
+    auto delta = std::fmod(aTo - aFrom + 540.0f, 360.0f) - 180.0f;
+    return aFrom + delta * aT;
+}
+
 // Yaw only: a standing body needs no pitch or roll, and sending three angles for
 // one useful one would be waste on an unreliable channel.
 Red::Quaternion YawToQuaternion(float aDegrees)
@@ -389,7 +402,7 @@ bool DestroyBodyEntity(Red::EntityID aEntityId)
 }
 } // namespace
 
-void WorldSystem::PumpRemotePlayers()
+void WorldSystem::PumpRemotePlayers(uint64_t aNowMs)
 {
     auto& net = Plugin::Net();
 
@@ -497,35 +510,81 @@ void WorldSystem::PumpRemotePlayers()
             continue; // still spawning
         }
 
-        // Velocity from the previous snapshot rather than from the frame: snapshots
-        // arrive at 15 Hz and the frame runs at 60, so per-frame deltas would be zero
-        // most of the time.
-        Red::Vector3 velocity{};
-        if (body.hasPrevious && snapshot.tick > body.previousTick)
+        // A new snapshot joins the history, stamped with local arrival time.
+        if (snapshot.tick > body.lastTick)
         {
-            const auto elapsed = static_cast<float>(snapshot.tick - body.previousTick) * 0.066f;
-            if (elapsed > 0.0f)
+            body.lastTick = snapshot.tick;
+            body.samples.push_back({aNowMs, snapshot.x, snapshot.y, snapshot.z, snapshot.rotation});
+
+            if (body.samples.size() > kMaxSamples)
             {
-                velocity.X = (snapshot.x - body.previousX) / elapsed;
-                velocity.Y = (snapshot.y - body.previousY) / elapsed;
-                velocity.Z = (snapshot.z - body.previousZ) / elapsed;
+                body.samples.erase(body.samples.begin());
             }
         }
 
-        if (!body.hasPrevious || snapshot.tick != body.previousTick)
+        if (body.samples.empty())
         {
-            body.hasPrevious = true;
-            body.previousTick = snapshot.tick;
-            body.previousX = snapshot.x;
-            body.previousY = snapshot.y;
-            body.previousZ = snapshot.z;
+            continue;
         }
 
+        client::RemoteSnapshot target = snapshot;
+        Red::Vector3 velocity{};
+
+        if (m_interpolate.load(std::memory_order_relaxed))
+        {
+            const auto renderMs = aNowMs > kInterpolationDelayMs ? aNowMs - kInterpolationDelayMs : 0;
+
+            const Sample* before = nullptr;
+            const Sample* after = nullptr;
+
+            for (const auto& sample : body.samples)
+            {
+                if (sample.localMs <= renderMs)
+                {
+                    before = &sample;
+                }
+                else
+                {
+                    after = &sample;
+                    break;
+                }
+            }
+
+            if (before && after && after->localMs > before->localMs)
+            {
+                const auto span = static_cast<float>(after->localMs - before->localMs);
+                const auto t = static_cast<float>(renderMs - before->localMs) / span;
+
+                target.x = before->x + (after->x - before->x) * t;
+                target.y = before->y + (after->y - before->y) * t;
+                target.z = before->z + (after->z - before->z) * t;
+                target.rotation = LerpAngleDegrees(before->rotation, after->rotation, t);
+
+                const auto seconds = span / 1000.0f;
+                velocity.X = (after->x - before->x) / seconds;
+                velocity.Y = (after->y - before->y) / seconds;
+                velocity.Z = (after->z - before->z) / seconds;
+            }
+            else
+            {
+                // No later sample to aim at: hold the newest rather than extrapolate
+                // into a position that never existed.
+                const auto& newest = body.samples.back();
+                target.x = newest.x;
+                target.y = newest.y;
+                target.z = newest.z;
+                target.rotation = newest.rotation;
+
+                m_starvedFrames.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        const auto& snapshotToApply = target;
         const auto mode = m_moveMode.load(std::memory_order_relaxed);
 
         if (mode == 0 || mode == 2)
         {
-            if (WriteTransform(entity, snapshot))
+            if (WriteTransform(entity, snapshotToApply))
             {
                 m_transformWrites.fetch_add(1, std::memory_order_relaxed);
             }
@@ -533,7 +592,7 @@ void WorldSystem::PumpRemotePlayers()
 
         if (mode == 1 || mode == 2)
         {
-            if (WriteMover(entity, snapshot, velocity))
+            if (WriteMover(entity, snapshotToApply, velocity))
             {
                 m_moverWrites.fetch_add(1, std::memory_order_relaxed);
             }
@@ -545,7 +604,7 @@ void WorldSystem::PumpRemotePlayers()
 
         if (mode == 3)
         {
-            if (WriteTeleport(entity, snapshot))
+            if (WriteTeleport(entity, snapshotToApply))
             {
                 m_transformWrites.fetch_add(1, std::memory_order_relaxed);
             }
@@ -612,10 +671,12 @@ void WorldSystem::OnMultiplayerUpdate(Red::FrameInfo& aFrame, Red::JobQueue&)
 {
     RunTick(aFrame, m_multiplayerTicks);
 
-    PumpRemotePlayers();
-    SendLocalState(static_cast<uint64_t>(
+    const auto nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-            .count()));
+            .count());
+
+    PumpRemotePlayers(nowMs);
+    SendLocalState(nowMs);
 }
 
 // No logging and no allocation in here: this is the hottest path in the plugin.
@@ -764,12 +825,20 @@ Red::CString WorldSystem::GetRemoteStats()
         }
     }
 
+    size_t samples = 0;
+    for (const auto& [playerId, body] : self->m_bodies)
+    {
+        samples += body.samples.size();
+    }
+
     const auto text = std::format("bodies={} spawned={} snapshots={} statesSent={} outOfOrder={} tracked={} "
-                                  "moveMode={} moverWrites={} transformWrites={} moverMissing={}",
+                                  "moveMode={} moverWrites={} transformWrites={} moverMissing={} "
+                                  "interp={} samples={} starved={}",
                                   self->m_bodies.size(), spawned, stats.statesReceived, stats.statesSent,
                                   stats.statesOutOfOrder, stats.remoteCount, self->m_moveMode.load(),
                                   self->m_moverWrites.load(), self->m_transformWrites.load(),
-                                  self->m_moverMissing.load());
+                                  self->m_moverMissing.load(), self->m_interpolate.load() ? "on" : "off", samples,
+                                  self->m_starvedFrames.load());
 
     CYBERMP_INFO("%s", text.c_str());
 
@@ -860,6 +929,22 @@ Red::CString WorldSystem::SetMoveMode(uint32_t aMode)
     return Red::CString(std::format("move mode {} ({})", aMode, kNames[aMode]).c_str());
 }
 
+Red::CString WorldSystem::SetInterpolation(bool aEnabled)
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    self->m_interpolate.store(aEnabled, std::memory_order_relaxed);
+    self->m_starvedFrames = 0;
+
+    CYBERMP_INFO("interpolation %s", aEnabled ? "on" : "off");
+
+    return aEnabled ? "interpolation on" : "interpolation off (raw snapshots, stepped)";
+}
+
 Red::CString WorldSystem::SetBodyKind(uint32_t aKind)
 {
     auto* self = Red::GetGameSystem<WorldSystem>();
@@ -884,7 +969,8 @@ Red::CString WorldSystem::SetBodyKind(uint32_t aKind)
 
         body.entityId = {};
         body.spawnRequested = false;
-        body.hasPrevious = false;
+        body.lastTick = 0;
+        body.samples.clear();
         ++reset;
     }
 
@@ -912,4 +998,5 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(DumpRemoteComponents);
     RTTI_METHOD(SetMoveMode);
     RTTI_METHOD(SetBodyKind);
+    RTTI_METHOD(SetInterpolation);
 });

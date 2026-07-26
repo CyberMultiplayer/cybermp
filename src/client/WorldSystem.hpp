@@ -66,6 +66,10 @@ public:
     // to fight, which separates "can we move a body" from "can we drive a puppet".
     static Red::CString SetBodyKind(uint32_t aKind);
 
+    // Off replays raw snapshots, which is visibly stepped at 15 Hz. Kept switchable
+    // so the difference can be seen rather than asserted.
+    static Red::CString SetInterpolation(bool aEnabled);
+
 private:
     void OnWorldAttached(Red::world::RuntimeScene* aScene) override;
     void OnWorldDetached(Red::world::RuntimeScene* aScene) override;
@@ -79,23 +83,30 @@ private:
     void RunTick(Red::FrameInfo& aFrame, std::atomic_uint64_t& aCounter);
 
     // All of these run on a tick thread, never on the network thread.
-    void PumpRemotePlayers();
+    void PumpRemotePlayers(uint64_t aNowMs);
     void SendLocalState(uint64_t aNowMs);
 
     // A remote player is drawn by an npc for now. The game has no third person body
     // for V, so a real player model needs a custom .ent -- deferred on purpose.
+    // One received snapshot, stamped with when it arrived here rather than with the
+    // sender's tick: interpolation is driven by our own clock, and the two clocks are
+    // not synchronised.
+    struct Sample
+    {
+        uint64_t localMs{};
+        float x{};
+        float y{};
+        float z{};
+        float rotation{};
+    };
+
     struct RemoteBody
     {
         Red::EntityID entityId;
         bool spawnRequested{};
 
-        // Previous snapshot, so a velocity can be derived. The animation system reads
-        // speed off the mover, so without it a moving body would slide.
-        bool hasPrevious{};
-        uint64_t previousTick{};
-        float previousX{};
-        float previousY{};
-        float previousZ{};
+        uint64_t lastTick{};
+        std::vector<Sample> samples;
     };
 
     std::unordered_map<uint32_t, RemoteBody> m_bodies;
@@ -106,6 +117,8 @@ private:
     std::atomic_uint64_t m_moverWrites{};
     std::atomic_uint64_t m_transformWrites{};
     std::atomic_uint64_t m_moverMissing{};
+    std::atomic_bool m_interpolate{true};
+    std::atomic_uint64_t m_starvedFrames{};
 
     // Every tick counter is written from the game thread and read from the script
     // thread, so they are atomic rather than plain.
