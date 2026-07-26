@@ -25,6 +25,17 @@ set(CYBERMP_GAME_DIR "" CACHE PATH "Cyberpunk 2077 install root (e.g. D:/Cyberpu
 # Static lib by default, so the sdk compiles once instead of per translation unit.
 add_subdirectory(vendor/RED4ext.SDK)
 
+# Header-only RTTI helpers on top of the sdk.
+add_subdirectory(vendor/RedLib)
+
+# Treat vendor headers as system, otherwise their deprecation warnings drown ours.
+foreach(dep RED4ext.SDK RedLib)
+    get_target_property(dep_includes ${dep} INTERFACE_INCLUDE_DIRECTORIES)
+    if(dep_includes)
+        set_target_properties(${dep} PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${dep_includes}")
+    endif()
+endforeach()
+
 add_subdirectory(src/client)
 
 include(cmake/Deploy.cmake)

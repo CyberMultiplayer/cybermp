@@ -1,5 +1,7 @@
 #include "Plugin.hpp"
 
+#include <RedLib.hpp>
+
 #include "Log.hpp"
 
 const RED4ext::v1::Sdk* Plugin::s_sdk = nullptr;
@@ -9,6 +11,10 @@ void Plugin::OnLoad(RED4ext::v1::PluginHandle aHandle, const RED4ext::v1::Sdk* a
 {
     s_handle = aHandle;
     s_sdk = aSdk;
+
+    // Queues every RTTI_DEFINE_* in the binary. Actual registration happens when the
+    // game builds its RTTI, not right now.
+    Red::TypeInfoRegistrar::RegisterDiscovered();
 
     // Game allocators aren't up yet, so keep this cheap. Real init goes in a game state later.
     const auto& runtime = *aSdk->runtime;

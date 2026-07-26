@@ -3,9 +3,11 @@ add_library(cybermp SHARED
     Plugin.cpp
     Plugin.hpp
     Log.hpp
+    DebugApi.cpp
+    DebugApi.hpp
 )
 
-target_link_libraries(cybermp PRIVATE RED4ext::SDK)
+target_link_libraries(cybermp PRIVATE RED4ext::SDK RedLib)
 
 target_compile_definitions(cybermp PRIVATE
     WIN32_LEAN_AND_MEAN
