@@ -50,7 +50,10 @@ public:
     UdpSocket& operator=(const UdpSocket&) = delete;
 
     bool Open();
+
+    // Pass 0 to let the OS pick a free port, then read it back with LocalPort().
     bool Bind(uint16_t aPort);
+    uint16_t LocalPort() const;
     void Close();
 
     bool SendTo(const Endpoint& aTo, std::span<const uint8_t> aData);

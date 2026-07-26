@@ -71,6 +71,24 @@ bool UdpSocket::Bind(uint16_t aPort)
     return bind(static_cast<SOCKET>(m_handle), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != SOCKET_ERROR;
 }
 
+uint16_t UdpSocket::LocalPort() const
+{
+    if (!m_open)
+    {
+        return 0;
+    }
+
+    sockaddr_in address{};
+    int size = sizeof(address);
+
+    if (getsockname(static_cast<SOCKET>(m_handle), reinterpret_cast<sockaddr*>(&address), &size) == SOCKET_ERROR)
+    {
+        return 0;
+    }
+
+    return ntohs(address.sin_port);
+}
+
 void UdpSocket::Close()
 {
     if (m_open)

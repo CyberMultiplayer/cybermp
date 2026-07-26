@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "Net.hpp"
 #include "Protocol.hpp"
 #include "Serialize.hpp"
 
@@ -224,6 +225,143 @@ void TestVersionMismatch()
     CHECK(received.version != proto::kVersion);
 }
 
+// Real udp loopback, but both ends live here: no spawned process, no redirected
+// file, no sleep. The PowerShell smoke test covered the same ground and went
+// flaky on CI for exactly those reasons.
+void TestLoopbackExchange()
+{
+    std::printf("loopback handshake and ping over real udp\n");
+
+    net::Startup startup;
+    CHECK(startup.ok());
+
+    net::UdpSocket server;
+    net::UdpSocket client;
+
+    CHECK(server.Bind(0)); // 0 means the OS picks a free port, so CI can't collide
+    CHECK(client.Open());
+
+    const auto port = server.LocalPort();
+    CHECK(port != 0);
+
+    const auto target = net::UdpSocket::Loopback(port);
+    std::vector<uint8_t> out;
+    std::vector<uint8_t> in(proto::kMaxDatagram);
+
+    // --- handshake ---
+    proto::Hello hello;
+    hello.username = "loopback";
+    CHECK(proto::Encode(hello, out));
+    CHECK(client.SendTo(target, {out.data(), out.size()}));
+
+    auto got = server.RecvFrom(in, 2000);
+    CHECK(got.has_value());
+
+    if (got)
+    {
+        proto::Header header;
+        CHECK(proto::PeekHeader({in.data(), got->size}, header));
+        CHECK(header.type == proto::Type::Hello);
+
+        proto::Hello decoded;
+        CHECK(proto::Decode({in.data(), got->size}, decoded));
+        CHECK(decoded.username == "loopback");
+        CHECK(decoded.version == proto::kVersion);
+
+        proto::HelloAck ack;
+        ack.accepted = true;
+        CHECK(proto::Encode(ack, out));
+        CHECK(server.SendTo(got->from, {out.data(), out.size()}));
+
+        got = client.RecvFrom(in, 2000);
+        CHECK(got.has_value());
+
+        if (got)
+        {
+            proto::HelloAck decodedAck;
+            CHECK(proto::Decode({in.data(), got->size}, decodedAck));
+            CHECK(decodedAck.accepted);
+        }
+    }
+
+    // --- ping keeps the client's timestamp intact ---
+    proto::Ping ping;
+    ping.sentAt = 0x1122334455667788ull;
+    CHECK(proto::Encode(ping, out));
+    CHECK(client.SendTo(target, {out.data(), out.size()}));
+
+    got = server.RecvFrom(in, 2000);
+    CHECK(got.has_value());
+
+    if (got)
+    {
+        proto::Ping decoded;
+        CHECK(proto::Decode({in.data(), got->size}, decoded));
+        CHECK(decoded.sentAt == ping.sentAt);
+    }
+}
+
+void TestLoopbackVersionRefusal()
+{
+    std::printf("server refuses a mismatched protocol version\n");
+
+    net::Startup startup;
+    net::UdpSocket server;
+    net::UdpSocket client;
+
+    CHECK(server.Bind(0));
+    CHECK(client.Open());
+
+    const auto target = net::UdpSocket::Loopback(server.LocalPort());
+    std::vector<uint8_t> out;
+    std::vector<uint8_t> in(proto::kMaxDatagram);
+
+    proto::Hello hello;
+    hello.version = proto::kVersion + 1;
+    hello.username = "future";
+    CHECK(proto::Encode(hello, out));
+    CHECK(client.SendTo(target, {out.data(), out.size()}));
+
+    const auto got = server.RecvFrom(in, 2000);
+    CHECK(got.has_value());
+
+    if (got)
+    {
+        proto::Hello decoded;
+        CHECK(proto::Decode({in.data(), got->size}, decoded));
+
+        // The decode has to succeed for the server to explain the refusal.
+        CHECK(decoded.version != proto::kVersion);
+    }
+}
+
+void TestLoopbackJunkIsDropped()
+{
+    std::printf("junk datagram is rejected, not parsed\n");
+
+    net::Startup startup;
+    net::UdpSocket server;
+    net::UdpSocket client;
+
+    CHECK(server.Bind(0));
+    CHECK(client.Open());
+
+    const auto target = net::UdpSocket::Loopback(server.LocalPort());
+    const std::vector<uint8_t> junk{0xFF, 0xEE, 0xDD, 0xCC, 0xBB};
+    CHECK(client.SendTo(target, {junk.data(), junk.size()}));
+
+    std::vector<uint8_t> in(proto::kMaxDatagram);
+    const auto got = server.RecvFrom(in, 2000);
+    CHECK(got.has_value());
+
+    if (got)
+    {
+        // Arrives fine at the transport layer, and the protocol layer must refuse it.
+        proto::Header header;
+        CHECK(!proto::PeekHeader({in.data(), got->size}, header));
+    }
+}
+
 void TestDatagramCap()
 {
     std::printf("oversized message is refused, not truncated\n");
@@ -250,6 +388,9 @@ int main()
     TestTruncatedAndPaddedBody();
     TestVersionMismatch();
     TestDatagramCap();
+    TestLoopbackExchange();
+    TestLoopbackVersionRefusal();
+    TestLoopbackJunkIsDropped();
 
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
 

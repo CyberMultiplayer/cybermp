@@ -22,12 +22,11 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Protocol tests
+      # Covers protocol and udp loopback in-process. The equivalent PowerShell
+      # script (tools/nettest.ps1) stays a dev tool: spawning a process and
+      # redirecting its output behaved differently here and went flaky.
+      - name: Tests
         run: ctest --test-dir build -C Release --output-on-failure
-
-      - name: Transport end to end
-        shell: pwsh
-        run: .\tools\nettest.ps1
 
       - name: Check output is x64
         shell: pwsh
