@@ -25,6 +25,61 @@ Red::Handle<Red::GameObject> GetLocalPlayer()
 
     return player;
 }
+
+// Builds a spec placed on the player. Caller fills in templatePath or recordID.
+Red::Handle<Red::IScriptable> MakeSpecAtPlayer()
+{
+    auto spec = Red::MakeScriptedHandle<Red::IScriptable>("DynamicEntitySpec");
+    if (!spec)
+    {
+        CYBERMP_ERROR("DynamicEntitySpec not found -- is Codeware installed?");
+        return {};
+    }
+
+    auto* position = Red::GetPropertyPtr<Red::Vector4>(spec.instance, "position");
+    auto* persistState = Red::GetPropertyPtr<bool>(spec.instance, "persistState");
+    auto* persistSpawn = Red::GetPropertyPtr<bool>(spec.instance, "persistSpawn");
+
+    if (!position || !persistState || !persistSpawn)
+    {
+        CYBERMP_ERROR("DynamicEntitySpec layout changed");
+        return {};
+    }
+
+    *position = WorldSystem::GetPlayerPosition();
+
+    // The server owns what we spawn, never the save file.
+    *persistState = false;
+    *persistSpawn = false;
+
+    return spec;
+}
+
+bool SubmitSpec(const Red::Handle<Red::IScriptable>& aSpec, Red::EntityID& aEntityID)
+{
+    Red::Handle<Red::IScriptable> system;
+    if (!Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", system) || !system)
+    {
+        CYBERMP_ERROR("GetDynamicEntitySystem failed");
+        return false;
+    }
+
+    if (!Red::CallVirtual(system.instance, "CreateEntity", aEntityID, aSpec))
+    {
+        CYBERMP_ERROR("CreateEntity call failed");
+        return false;
+    }
+
+    // An unknown record or template doesn't fail the call, it hands back a null id.
+    // Without this check a typo looks exactly like a successful spawn.
+    if (!aEntityID.IsDefined())
+    {
+        CYBERMP_ERROR("CreateEntity returned a null id -- unknown record or template?");
+        return false;
+    }
+
+    return true;
+}
 } // namespace
 
 void WorldSystem::OnWorldAttached(Red::world::RuntimeScene*)
@@ -79,50 +134,65 @@ Red::CString WorldSystem::SpawnProp()
 {
     constexpr auto kTemplate = "base\\gameplay\\devices\\ladder\\appearances\\10m_gen_default.ent";
 
-    auto spec = Red::MakeScriptedHandle<Red::IScriptable>("DynamicEntitySpec");
+    auto spec = MakeSpecAtPlayer();
     if (!spec)
     {
-        CYBERMP_ERROR("DynamicEntitySpec not found -- is Codeware installed?");
-        return "no DynamicEntitySpec";
+        return "spec failed";
     }
 
     auto* templatePath = Red::GetPropertyPtr<Red::ResRef>(spec.instance, "templatePath");
-    auto* position = Red::GetPropertyPtr<Red::Vector4>(spec.instance, "position");
-    auto* persistState = Red::GetPropertyPtr<bool>(spec.instance, "persistState");
-    auto* persistSpawn = Red::GetPropertyPtr<bool>(spec.instance, "persistSpawn");
-
-    if (!templatePath || !position || !persistState || !persistSpawn)
+    if (!templatePath)
     {
-        CYBERMP_ERROR("DynamicEntitySpec layout changed");
-        return "bad spec layout";
+        CYBERMP_ERROR("templatePath property missing");
+        return "no templatePath";
     }
 
     templatePath->resource = Red::ResourcePath(kTemplate);
-    *position = GetPlayerPosition();
-
-    // The server owns what we spawn, never the save file.
-    *persistState = false;
-    *persistSpawn = false;
-
-    Red::Handle<Red::IScriptable> system;
-    if (!Red::CallStatic("ScriptGameInstance", "GetDynamicEntitySystem", system) || !system)
-    {
-        CYBERMP_ERROR("GetDynamicEntitySystem failed");
-        return "no DynamicEntitySystem";
-    }
 
     Red::EntityID entityID;
-    if (!Red::CallVirtual(system.instance, "CreateEntity", entityID, spec))
+    if (!SubmitSpec(spec, entityID))
     {
-        CYBERMP_ERROR("CreateEntity call failed");
         return "CreateEntity failed";
     }
 
     // Spawning is async: a valid id here only means the request was accepted.
-    CYBERMP_INFO("spawn requested, id %llu at %.2f, %.2f, %.2f", entityID.hash, position->X, position->Y,
-                 position->Z);
+    CYBERMP_INFO("prop spawn requested, id %llu", entityID.hash);
 
     return Red::CString(std::format("spawn requested, id {}", entityID.hash).c_str());
+}
+
+// Takes the record name so different characters can be tried from the console
+// without rebuilding. Default is the one from Codeware's own docs.
+Red::CString WorldSystem::SpawnNpc(const Red::CString& aRecord)
+{
+    constexpr auto kDefaultRecord = "Character.spr_animals_bouncer1_ranged1_omaha_mb";
+
+    const char* record = aRecord.Length() > 0 ? aRecord.c_str() : kDefaultRecord;
+
+    auto spec = MakeSpecAtPlayer();
+    if (!spec)
+    {
+        return "spec failed";
+    }
+
+    auto* recordID = Red::GetPropertyPtr<Red::TweakDBID>(spec.instance, "recordID");
+    if (!recordID)
+    {
+        CYBERMP_ERROR("recordID property missing");
+        return "no recordID";
+    }
+
+    *recordID = Red::TweakDBID(record);
+
+    Red::EntityID entityID;
+    if (!SubmitSpec(spec, entityID))
+    {
+        return Red::CString(std::format("spawn refused, unknown record '{}'?", record).c_str());
+    }
+
+    CYBERMP_INFO("npc spawn requested, record '%s', id %llu", record, entityID.hash);
+
+    return Red::CString(std::format("spawn requested, record {}, id {}", record, entityID.hash).c_str());
 }
 
 RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
@@ -130,4 +200,5 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(GetPlayerPosition);
     RTTI_METHOD(GetPlayerPositionText);
     RTTI_METHOD(SpawnProp);
+    RTTI_METHOD(SpawnNpc);
 });
