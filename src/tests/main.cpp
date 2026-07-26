@@ -8,6 +8,7 @@
 #include "Net.hpp"
 #include "Protocol.hpp"
 #include "Serialize.hpp"
+#include "Session.hpp"
 
 namespace
 {
@@ -373,6 +374,114 @@ void TestDatagramCap()
     CHECK(proto::Encode(sent, buffer));
     CHECK(buffer.size() <= proto::kMaxDatagram);
 }
+net::Endpoint Peer(uint16_t aPort)
+{
+    return net::UdpSocket::Loopback(aPort);
+}
+
+void TestSessionJoin()
+{
+    std::printf("sessions: join, duplicate name, capacity\n");
+
+    server::SessionManager sessions(2, 1000);
+    server::PlayerId id = server::kInvalidPlayer;
+
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+    CHECK(id == 1); // 0 stays reserved for "no player"
+    CHECK(sessions.Count() == 1);
+
+    // Same name from a different peer must not create a second player.
+    CHECK(sessions.Join(Peer(2), "a", proto::kVersion, 0, id) == server::JoinResult::NameTaken);
+    CHECK(id == server::kInvalidPlayer);
+    CHECK(sessions.Count() == 1);
+
+    CHECK(sessions.Join(Peer(2), "b", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+    CHECK(id == 2);
+
+    CHECK(sessions.Join(Peer(3), "c", proto::kVersion, 0, id) == server::JoinResult::Full);
+    CHECK(sessions.Count() == 2);
+}
+
+void TestSessionVersionCheckedFirst()
+{
+    std::printf("sessions: version is checked before anything else\n");
+
+    server::SessionManager sessions(1, 1000);
+    server::PlayerId id = server::kInvalidPlayer;
+
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    // Server is full AND the version is wrong: the version has to win, otherwise the
+    // client is told the wrong thing.
+    CHECK(sessions.Join(Peer(2), "b", proto::kVersion + 1, 0, id) == server::JoinResult::VersionMismatch);
+}
+
+void TestSessionRepeatedHello()
+{
+    std::printf("sessions: a resent hello returns the same id\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::PlayerId first = server::kInvalidPlayer;
+    server::PlayerId second = server::kInvalidPlayer;
+
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, first) == server::JoinResult::Accepted);
+
+    // Udp loses acks, so clients do resend hello. That must not double up.
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 50, second) == server::JoinResult::AlreadyJoined);
+    CHECK(first == second);
+    CHECK(sessions.Count() == 1);
+}
+
+void TestSessionTimeout()
+{
+    std::printf("sessions: silent peers time out, traffic keeps them\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::PlayerId id = server::kInvalidPlayer;
+
+    CHECK(sessions.Join(Peer(1), "quiet", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+    CHECK(sessions.Join(Peer(2), "chatty", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+
+    CHECK(sessions.CollectTimedOut(500).empty()); // not yet
+    CHECK(sessions.Touch(Peer(2), 900));
+
+    const auto dropped = sessions.CollectTimedOut(1000);
+    CHECK(dropped.size() == 1);
+    CHECK(!dropped.empty() && dropped[0].username == "quiet");
+    CHECK(sessions.Count() == 1);
+    CHECK(sessions.Find(Peer(2)) != nullptr);
+    CHECK(sessions.Find(Peer(1)) == nullptr);
+}
+
+void TestSessionClockGoingBackwards()
+{
+    std::printf("sessions: a now that moves backwards must not drop everyone\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::PlayerId id = server::kInvalidPlayer;
+
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 5000, id) == server::JoinResult::Accepted);
+
+    // Unsigned subtraction here would look like a huge elapsed time.
+    CHECK(sessions.CollectTimedOut(1000).empty());
+    CHECK(sessions.Count() == 1);
+}
+
+void TestSessionRemove()
+{
+    std::printf("sessions: explicit removal\n");
+
+    server::SessionManager sessions(4, 1000);
+    server::PlayerId id = server::kInvalidPlayer;
+
+    CHECK(sessions.Join(Peer(1), "a", proto::kVersion, 0, id) == server::JoinResult::Accepted);
+    CHECK(sessions.Find(id) != nullptr);
+    CHECK(sessions.Remove(id));
+    CHECK(!sessions.Remove(id)); // already gone
+    CHECK(sessions.Find(id) == nullptr);
+    CHECK(sessions.Find(server::kInvalidPlayer) == nullptr);
+    CHECK(sessions.Count() == 0);
+}
 } // namespace
 
 int main()
@@ -391,6 +500,12 @@ int main()
     TestLoopbackExchange();
     TestLoopbackVersionRefusal();
     TestLoopbackJunkIsDropped();
+    TestSessionJoin();
+    TestSessionVersionCheckedFirst();
+    TestSessionRepeatedHello();
+    TestSessionTimeout();
+    TestSessionClockGoingBackwards();
+    TestSessionRemove();
 
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
 

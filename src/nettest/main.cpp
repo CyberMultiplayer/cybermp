@@ -1,13 +1,16 @@
 // Console client: handshake, then ping/pong with rtt. Stands in for the game so
 // the protocol can be exercised without launching it.
 //
-//   cybermp_nettest [port] [rounds] [protocolOverride]
+//   cybermp_nettest [port] [rounds] [protocolOverride] [username]
 //
 // The override exists to check the server actually refuses a mismatched version.
 
 #include <chrono>
 #include <cstdio>
+#include <string>
 #include <vector>
+
+#include <Windows.h> // GetCurrentProcessId, for a unique default name
 
 #include <Version.hpp>
 
@@ -72,9 +75,13 @@ int main(int argc, char** argv)
     size_t received = 0;
 
     // --- handshake ---
+    // Name derived from the pid so several instances can join at once without
+    // colliding on the server's duplicate-name check.
     proto::Hello hello;
     hello.version = protocolOverride;
-    hello.username = "nettest";
+    hello.username = argc > 4 ? argv[4] : ("nettest-" + std::to_string(GetCurrentProcessId()));
+
+    std::printf("joining as '%s'\n", hello.username.c_str());
 
     if (!proto::Encode(hello, request))
     {

@@ -2,7 +2,7 @@ add_executable(cybermp_tests
     main.cpp
 )
 
-target_link_libraries(cybermp_tests PRIVATE cybermp_common)
+target_link_libraries(cybermp_tests PRIVATE cybermp_common cybermp_serverlib)
 
 if(MSVC)
     target_compile_options(cybermp_tests PRIVATE /W4 /permissive-)

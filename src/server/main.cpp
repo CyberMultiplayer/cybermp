@@ -1,6 +1,7 @@
-// cybermp server -- speaks the B1 protocol: handshake then ping/pong.
-// Raw UDP for now. GameNetworkingSockets comes in once we need reliability and
-// encryption; the point here is the message loop, not the transport.
+// cybermp server -- handshake, sessions, timeouts, ping/pong.
+// Raw UDP for now; GameNetworkingSockets comes in once we need reliability and
+// encryption. Nothing is logged on the per-datagram path: unbuffered stdout costs
+// a syscall per line and showed up as +23 ms of rtt.
 
 #include <atomic>
 #include <chrono>
@@ -12,10 +13,14 @@
 
 #include "Net.hpp"
 #include "Protocol.hpp"
+#include "Session.hpp"
 
 namespace
 {
 constexpr uint16_t kDefaultPort = 11780;
+constexpr size_t kMaxPlayers = 32;
+constexpr uint64_t kTimeoutMs = 10000;
+constexpr uint32_t kPollMs = 250;
 
 std::atomic_bool g_running{true};
 
@@ -24,12 +29,19 @@ void OnSignal(int)
     g_running = false;
 }
 
+uint64_t NowMs()
+{
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
 bool Send(net::UdpSocket& aSocket, const net::Endpoint& aTo, const std::vector<uint8_t>& aData)
 {
     return aSocket.SendTo(aTo, {aData.data(), aData.size()});
 }
 
-void HandleHello(net::UdpSocket& aSocket, const net::Endpoint& aFrom, std::span<const uint8_t> aData)
+void HandleHello(net::UdpSocket& aSocket, server::SessionManager& aSessions, const net::Endpoint& aFrom,
+                 std::span<const uint8_t> aData, uint64_t aNowMs)
 {
     proto::Hello hello;
     if (!proto::Decode(aData, hello))
@@ -38,20 +50,23 @@ void HandleHello(net::UdpSocket& aSocket, const net::Endpoint& aFrom, std::span<
         return;
     }
 
+    server::PlayerId playerId = server::kInvalidPlayer;
+    const auto result = aSessions.Join(aFrom, hello.username, hello.version, aNowMs, playerId);
+
     proto::HelloAck ack;
-    ack.accepted = hello.version == proto::kVersion;
+    ack.accepted = result == server::JoinResult::Accepted || result == server::JoinResult::AlreadyJoined;
 
     if (!ack.accepted)
     {
-        // Say why, so a mismatched client can report something useful instead of
-        // silently failing to connect.
-        ack.reason = "protocol version mismatch";
-        std::printf("-- refused '%s': client protocol %u, server %u\n", hello.username.c_str(), hello.version,
-                    proto::kVersion);
+        // Always say why: a client that cannot connect needs something to show.
+        ack.reason = server::ToString(result);
+        std::printf("-- refused '%s' from %s: %s\n", hello.username.c_str(), aFrom.ToString().c_str(),
+                    ack.reason.c_str());
     }
-    else
+    else if (result == server::JoinResult::Accepted)
     {
-        std::printf("-- accepted '%s' from %s\n", hello.username.c_str(), aFrom.ToString().c_str());
+        std::printf("++ join  #%u '%s' from %s  (%zu online)\n", playerId, hello.username.c_str(),
+                    aFrom.ToString().c_str(), aSessions.Count());
     }
 
     std::vector<uint8_t> out;
@@ -61,16 +76,22 @@ void HandleHello(net::UdpSocket& aSocket, const net::Endpoint& aFrom, std::span<
     }
 }
 
-void HandlePing(net::UdpSocket& aSocket, const net::Endpoint& aFrom, std::span<const uint8_t> aData)
+void HandlePing(net::UdpSocket& aSocket, server::SessionManager& aSessions, const net::Endpoint& aFrom,
+                std::span<const uint8_t> aData)
 {
-    proto::Ping ping;
-    if (!proto::Decode(aData, ping))
+    // Only known peers get answered, so an unknown sender can't use us as a reflector.
+    if (!aSessions.Find(aFrom))
     {
-        std::printf("!! malformed ping from %s\n", aFrom.ToString().c_str());
         return;
     }
 
-    // Echo the client's own timestamp back: it measures the rtt, we stay stateless.
+    proto::Ping ping;
+    if (!proto::Decode(aData, ping))
+    {
+        return;
+    }
+
+    // Echo the client's own timestamp: it measures the rtt, we stay stateless.
     proto::Pong pong;
     pong.sentAt = ping.sentAt;
 
@@ -109,18 +130,33 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::printf("listening on udp %u, ctrl+c to stop\n", port);
+    std::printf("listening on udp %u, %zu slots, %llu ms timeout\n", port, kMaxPlayers, kTimeoutMs);
 
+    server::SessionManager sessions(kMaxPlayers, kTimeoutMs);
     std::vector<uint8_t> buffer(proto::kMaxDatagram);
-    uint64_t handled = 0;
     uint64_t rejected = 0;
 
     while (g_running)
     {
-        const auto received = socket.RecvFrom(buffer, 250);
+        const auto now = NowMs();
+
+        // Several peers can expire in one sweep, so the running total is only correct
+        // once the whole batch is gone. Report it after the loop, not per line.
+        const auto dropped = sessions.CollectTimedOut(now);
+        for (const auto& session : dropped)
+        {
+            std::printf("-- leave #%u '%s' timed out\n", session.id, session.username.c_str());
+        }
+
+        if (!dropped.empty())
+        {
+            std::printf("-- %zu online\n", sessions.Count());
+        }
+
+        const auto received = socket.RecvFrom(buffer, kPollMs);
         if (!received)
         {
-            continue; // timeout, poll again
+            continue; // poll timeout, loop so timeouts still get checked
         }
 
         const std::span<const uint8_t> datagram(buffer.data(), received->size);
@@ -129,33 +165,29 @@ int main(int argc, char** argv)
         if (!proto::PeekHeader(datagram, header))
         {
             // Anything off the wire can be junk. Drop it and keep serving.
-            std::printf("!! unreadable datagram from %s, %zu bytes\n", received->from.ToString().c_str(),
-                        received->size);
             ++rejected;
             continue;
         }
 
+        sessions.Touch(received->from, now);
+
         switch (header.type)
         {
         case proto::Type::Hello:
-            HandleHello(socket, received->from, datagram);
+            HandleHello(socket, sessions, received->from, datagram, now);
             break;
 
         case proto::Type::Ping:
-            HandlePing(socket, received->from, datagram);
+            HandlePing(socket, sessions, received->from, datagram);
             break;
 
         default:
-            std::printf("!! unexpected type %u from %s\n", static_cast<unsigned>(header.type),
-                        received->from.ToString().c_str());
             ++rejected;
             break;
         }
-
-        ++handled;
     }
 
-    std::printf("stopped, %llu handled, %llu rejected\n", handled, rejected);
+    std::printf("stopped, %zu online, %llu datagram(s) rejected\n", sessions.Count(), rejected);
 
     return 0;
 }

@@ -32,6 +32,12 @@ struct Endpoint
     uint16_t port{};
 
     std::string ToString() const;
+
+    // Udp has no connection, so the endpoint pair is what identifies a peer.
+    bool operator==(const Endpoint& aOther) const
+    {
+        return address == aOther.address && port == aOther.port;
+    }
 };
 
 struct Received
