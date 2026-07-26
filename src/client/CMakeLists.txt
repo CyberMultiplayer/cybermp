@@ -5,6 +5,8 @@ add_library(cybermp SHARED
     Log.hpp
     DebugApi.cpp
     DebugApi.hpp
+    WorldSystem.cpp
+    WorldSystem.hpp
 )
 
 target_link_libraries(cybermp PRIVATE RED4ext::SDK RedLib)
