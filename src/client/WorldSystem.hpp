@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -61,10 +62,15 @@ public:
     // instead of one build per guess.
     static Red::CString SetMoveMode(uint32_t aMode);
 
-    // 0 = npc from a Character record, 1 = a prop from a template.
-    // An npc has a motion planner that overwrites whatever we write; a prop has no ai
-    // to fight, which separates "can we move a body" from "can we drive a puppet".
+    // 0 = npc from a Character record, 1 = a template.
+    // A record spawns a full ai driven puppet whose motion planner overwrites us; a
+    // template spawns the body alone, which is what CyberpunkMP does with its .ent
+    // files rather than records.
     static Red::CString SetBodyKind(uint32_t aKind);
+
+    // Template used by kind 1. Settable from the console so candidates can be tried
+    // without a rebuild -- the game ships base_entities like man_base.ent.
+    static Red::CString SetBodyTemplate(const Red::CString& aPath);
 
     // Off replays raw snapshots, which is visibly stepped at 15 Hz. Kept switchable
     // so the difference can be seen rather than asserted.
@@ -114,6 +120,8 @@ private:
     uint64_t m_lastStateSentMs{};
     std::atomic_uint32_t m_moveMode{1};
     std::atomic_uint32_t m_bodyKind{0};
+    std::mutex m_templateMutex;
+    std::string m_bodyTemplate{"base\\characters\\base_entities\\man_base\\man_base.ent"};
     std::atomic_uint64_t m_moverWrites{};
     std::atomic_uint64_t m_transformWrites{};
     std::atomic_uint64_t m_moverMissing{};

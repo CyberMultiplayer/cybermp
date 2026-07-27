@@ -464,15 +464,16 @@ void WorldSystem::PumpRemotePlayers(uint64_t aNowMs)
 
             if (m_bodyKind.load(std::memory_order_relaxed) == 1)
             {
-                // A prop carries no ai, so nothing overwrites what we write.
+                // A template spawns the body without the ai that a Character record
+                // brings along, so nothing overwrites what we write.
                 auto* templatePath = Red::GetPropertyPtr<Red::ResRef>(spec.instance, "templatePath");
                 if (!templatePath)
                 {
                     continue;
                 }
 
-                templatePath->resource =
-                    Red::ResourcePath("base\\gameplay\\devices\\ladder\\appearances\\10m_gen_default.ent");
+                std::scoped_lock lock(m_templateMutex);
+                templatePath->resource = Red::ResourcePath(m_bodyTemplate.c_str());
             }
             else
             {
@@ -929,6 +930,31 @@ Red::CString WorldSystem::SetMoveMode(uint32_t aMode)
     return Red::CString(std::format("move mode {} ({})", aMode, kNames[aMode]).c_str());
 }
 
+Red::CString WorldSystem::SetBodyTemplate(const Red::CString& aPath)
+{
+    auto* self = Red::GetGameSystem<WorldSystem>();
+    if (!self)
+    {
+        return "no world system";
+    }
+
+    if (aPath.Length() == 0)
+    {
+        std::scoped_lock lock(self->m_templateMutex);
+        return Red::CString(std::format("current template: {}", self->m_bodyTemplate).c_str());
+    }
+
+    {
+        std::scoped_lock lock(self->m_templateMutex);
+        self->m_bodyTemplate = aPath.c_str();
+    }
+
+    CYBERMP_INFO("body template '%s'", aPath.c_str());
+
+    // Reuses the respawn path, so the change takes effect on the next snapshot.
+    return SetBodyKind(1);
+}
+
 Red::CString WorldSystem::SetInterpolation(bool aEnabled)
 {
     auto* self = Red::GetGameSystem<WorldSystem>();
@@ -998,5 +1024,6 @@ RTTI_DEFINE_CLASS(WorldSystem, "Cybermp.WorldSystem", {
     RTTI_METHOD(DumpRemoteComponents);
     RTTI_METHOD(SetMoveMode);
     RTTI_METHOD(SetBodyKind);
+    RTTI_METHOD(SetBodyTemplate);
     RTTI_METHOD(SetInterpolation);
 });
